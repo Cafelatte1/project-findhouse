@@ -196,8 +196,8 @@ def parse_hug(txt):
     sm = re.search(r'서울\s*([\d,]+)\s*호', txt)
     if sm: notes.append(f'서울 {sm.group(1)}호')
     dm = re.search(r'시중\s*(전세)?\s*시세의\s*(\d+)%\s*이하', txt)
-    if dm: notes.append(f'전세보증금 시중 시세의 {dm.group(2)}% 이하')
-    if len(ends) > 1: notes.append('공고문 내 접수 마감 표기 상이(' + ' / '.join(e[5:] for e in ends) + ') — 이른 날짜 기준 준비 권장')
+    if dm: notes.append(f'보증금 시세 {dm.group(2)}% 이하')
+    if len(ends) > 1: notes.append('마감 표기 상이(' + '/'.join(e[5:] for e in ends) + ', 이른 날 기준 준비)')
     em = re.search(r'\(입주자격\)\s*([^\n]*?무주택세대구성원)', txt)
     return dict(title=title, posted=posted, apply_start=starts[0] if starts else posted, apply_end=ends[-1] if ends else None,
                 status=None, extra_note=' · '.join(notes) or None, elig=(clean(em.group(1)) if em else None))

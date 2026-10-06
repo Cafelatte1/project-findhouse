@@ -82,24 +82,30 @@ Example (both types, both targets):
 
 ✅ **조건 부합** (2)
 
-• 🏠 **[단지명](url)** · 신혼부부
-  - 44.42㎡
-  - 보증금 1,953만 / 월세 25.44만 (보증금50%)
-  - 접수 기간 원문 확인
-  - 자격: 세대 기준 공고(무주택세대구성원 등) — 자격 원문 확인
+• 🏠 **[SH 신혼·신생아 매입임대Ⅰ](url)** · 신혼부부
+  - 서도휴빌(2차) · 강동구 · 둔촌동역 · 44.42㎡
+  - 보증금 1,953만 / 월세 25.44만 (보증금50%) · 자동추출
+  - 무주택세대 자격
 
 **전세**
 • 기준: 전세 보증금 ≤2억
 
 ✅ **조건 부합** (1)
 
-• 🏠 **[단지명](url)** · 청년
-  - 20㎡
-  - 🔁 전환 · 보증금 1억 8,410만 / 월세 3.24만
-  - 접수 2026-10-06 ~ 2026-10-09 · 마감 임박
+• 🏠 **[청계로벤하임](url)** · 청년
+  - 동묘앞역 · 20㎡
+  - 🔁 전환 · 보증금 1억 8,410만 / 월세 3.24만 · 자동추출
+  - 접수 10-06 ~ 10-09 · 마감 임박
 ```
 
 With a single target no target tag is printed, and with a single lease type the block heading is omitted (the original template).
+The link text is the complex name (human-recorded name, else a cleaned-up title); notices that bundle many complexes use a short
+program name (e.g. `SH 재개발임대 일반모집`) and put the best unit's complex in the first sub-bullet. Each item has at most 3 sub-bullets
+(location/area · price · window/eligibility); unknown parts are omitted rather than shown as placeholders.
+
+Targets: a title for one target only (e.g. 신혼·신생아) is shown only when that target is selected; mixed titles (`청년·신혼부부`,
+`청년 및 신혼부부`) and untagged notices are shown for either selection, and unit rows for unselected targets are dropped.
+(Intentional change: the original monitor dropped mixed titles for youth-only configs.)
 `--format cards` prints the legacy card report.
 
 ## Commands

@@ -23,8 +23,10 @@ def lease_of(it):
     return 'monthly'
 
 def notice_targets(it):
-    """제목·카테고리에 명시된 대상 {'youth','newlywed'} (빈 집합 = 일반/혼합 → 주택형 표의 공급대상으로 판단)."""
-    t = (it.get('title') or '') + ' ' + (it.get('category') or '')
+    """제목·카테고리에 명시된 대상 {'youth','newlywed'}. 빈 집합 = 일반 공고 → 주택형 표의 공급대상으로 판단.
+    둘 다 = 혼합 공고('청년·신혼부부', '청년 및 신혼부부') → 어느 한쪽만 골라도 포함(주택형 행은 선택 대상만 판정).
+    '청년안심주택'은 사업명이라 대상 표기로 보지 않는다(신혼부부형도 있음)."""
+    t = re.sub(r'청년안심주택', '', (it.get('title') or '') + ' ' + (it.get('category') or ''))
     return ({'newlywed'} if NEWLYWED.search(t) else set()) | ({'youth'} if YOUTH.search(t) else set())
 
 def elig_note(it, lease, meta):
@@ -43,7 +45,7 @@ def norm_title(t):
 
 def is_relevant(it, cfg=None):
     """선택한 임대유형(lease_types)·대상(targets)·지원 프로그램(support_programs) 기준 관련성.
-    설정에 새 키가 없으면(월세+청년) 구 EXCLUDE 규칙과 같은 결과가 되도록 설계(selftest 고정)."""
+    설정에 새 키가 없으면(월세+청년) 구 EXCLUDE 규칙과 같은 결과 — 단, 청년+신혼 혼합 제목 공고는 포함(의도적 변경, selftest 고정)."""
     cfg = cfg or {}
     lt = cfg.get('lease_types') or ['monthly']; tg = cfg.get('targets') or ['youth']
     nw, yo = 'newlywed' in tg, 'youth' in tg
@@ -54,17 +56,18 @@ def is_relevant(it, cfg=None):
     elif lease == 'jeonse':
         if 'jeonse' not in lt: return False
     elif not lt: return False          # monthly 공고: 월세 선택 시 + 전세 선택 시(🔁 전세에 가까운 옵션 탐색)
+    # 대상 표기: 한 대상 전용 공고는 그 대상을 골랐을 때만, 혼합(둘 다 표기)·일반(표기 없음)은 항상 → 주택형 행으로 거름.
+    # (구 동작과 다른 점: 청년만 골라도 '청년·신혼부부' 혼합 제목 공고를 포함 — 의도적 변경)
+    if nt == {'newlywed'} and not nw: return False
+    if nt == {'youth'} and not yo: return False
     if src == 'soco':                  # 청년안심주택: 청년·신혼부부 주택형 혼합 → 주택형 표로 거름
-        if not nw and '신혼부부' in t: return False
         return lease == 'monthly' or lease in lt
     if NOISE.search(t) or ALWAYS_EX.search(t): return False
     if not nw and NEWLYWED_ONLY_EX.search(t): return False
-    if 'newlywed' in nt and not nw: return False          # 신혼부부를 고르지 않음 → 신혼 표기 공고 제외(구 동작)
-    if nt == {'youth'} and not yo: return False           # 신혼부부만 고름 → 청년 전용 공고 제외
     if src == 'socialhousing': return it.get('status') == '모집중' and '서울' in (it.get('address') or '')
     if src == 'lh' and it.get('category') in ('행복주택',): return True
     if lease != 'monthly' or src == 'hug': return True
-    return bool(RELEVANT.search(t)) or (nw and bool(NEWLYWED.search(t)))
+    return bool(RELEVANT.search(t)) or bool(NEWLYWED.search(t) and nw)
 
 def dedup(items):
     """같은 소스 내 재게시(다른 seq, 같은 제목) → 최신 posted 1건만 대표. seoulportal 은 SH 게시글과 제목이 같으면 상태만 SH에 병합."""

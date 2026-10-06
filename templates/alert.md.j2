@@ -9,18 +9,19 @@
 {{ title }} ({{ secs[key]|length }})
 
 {% for r in secs[key] %}
-• 🏠 **[{{ r.name or r.title }}]({{ r.url }})**{% if both_targets and r.target %} · {{ r.target }}{% endif %}
-  - {{ r.gu }} · {{ r.station }} · {{ r.area_m2 }}㎡
-  - {% if r.conv %}🔁 전환 · {% endif %}{% if lease == 'jeonse' and not r.conv %}전세 {{ man(r.deposit) }}{% else %}보증금 {{ man(r.deposit) }} / 월세 {{ man(r.rent) }}{% endif %}
-  - 접수 {{ r.apply_start }} ~ {{ r.apply_end }}{% if r.is_due_soon %} · 마감 임박{% endif %}
-{% if r.elig_note %}  - 자격: {{ r.elig_note }}{% endif %}
+• 🏠 **[{{ r.short_name }}]({{ r.url }})**{% if both_targets and r.target %} · {{ r.target }}{% endif %}
+{# 하위 줄 최대 3줄, 모르는 값은 생략(join 은 빈 값 제외) #}
+  - {{ [r.complex, r.gu, r.station, r.area_m2 ~ '㎡' if r.area_m2] | select | join(' · ') }}
+  - {% if r.conv %}🔁 전환 · {% endif %}{% if lease == 'jeonse' and not r.conv %}전세 {{ man(r.deposit) }}{% else %}보증금 {{ man(r.deposit) }} / 월세 {{ man(r.rent) }}{% endif %}{% if r.auto %} · 자동추출{% endif %}
+  - {{ [r.period, '마감 임박' if r.is_due_soon, r.elig_short] | select | join(' · ') }}
 {% endfor %}{% endfor %}{% endfor %}
 {% if support %}
 
 📋 **지원 프로그램** ({{ support|length }})
 {% for r in support %}
 • [{{ r.title }}]({{ r.url }})
-  - 접수 ~ {{ r.apply_end }} · 입주자가 주택을 구해 신청 · 가격 판정 없음
+  - 접수 ~ {{ r.apply_end }}
+  - 집을 직접 구해 신청 · 가격 판정 없음
 {% endfor %}{% endif %}
 {% if fails %}
 

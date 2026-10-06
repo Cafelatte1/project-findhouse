@@ -190,7 +190,15 @@ TITLES = [('sh', '2026년 하반기 신혼·신생아 매입임대주택Ⅰ 입�
           ('sh', '청년·신혼부부 매입임대주택 입주자 모집', None), ('sh', '재개발임대주택 입주자 모집', None), ('sh', '제8차 장기전세주택2(미리내집) 청약접수 결과 안내', None)]
 items = [dict(source=a, item_id=str(i), title=t, category=c) for i, (a, t, c) in enumerate(TITLES)] + \
         [dict(source='socialhousing', item_id='s', title='테스트 사회주택 모집', status='모집중', address='서울 마포구')]
-ok(all(old_rel(it) == collect.is_relevant(it, cfg) for it in items), '관련성: 구 설정에서 구 EXCLUDE 규칙과 동일')
+def mixed(it): return collect.notice_targets(it) == {'youth', 'newlywed'}       # 의도적 변경: 혼합 제목은 청년만 골라도 포함
+ok(all((old_rel(it) or mixed(it)) == collect.is_relevant(it, cfg) for it in items) and any(mixed(it) and not old_rel(it) for it in items),
+   '관련성: 구 설정에서 구 EXCLUDE 규칙과 동일(혼합 대상 제목만 예외로 포함)')
+MX = [dict(source='sh', item_id='m1', title='2026년 청년·신혼부부 매입임대주택 입주자 모집공고'), dict(source='sh', item_id='m2', title='청년 및 신혼부부 행복주택 입주자 모집'),
+      dict(source='soco', item_id='m3', title='[민간임대] 테스트역 청년안심주택 청년·신혼부부 추가모집'), dict(source='soco', item_id='m4', title='[민간임대] 테스트역 청년안심주택 신혼부부 추가모집'),
+      dict(source='sh', item_id='m5', title='2026년 신혼·신생아 매입임대주택 입주자 모집공고'), dict(source='sh', item_id='m6', title='2026년 청년 매입임대주택 입주자 모집공고')]
+yo_only, nw_only = dict(targets=['youth']), dict(targets=['newlywed'])
+ok([collect.is_relevant(x, yo_only) for x in MX] == [True, True, True, False, False, True]
+   and [collect.is_relevant(x, nw_only) for x in MX] == [True, True, True, True, True, False], '혼합 대상 제목: 청년만·신혼만 모두 포함, 단일 대상 제목은 해당 대상만')
 CB = dict(lease_types=['monthly', 'jeonse'], targets=['youth', 'newlywed'], support_programs=True)
 def rel(prefix): return next(collect.is_relevant(it, CB) for it in items if it['title'].startswith(prefix))
 ok(rel('2026년 하반기 신혼') and rel('제51차 장기전세주택') and rel('2026년 전세임대형') and rel('서울대방 신혼희망타운') and rel('2026년 일반주택형')
@@ -209,6 +217,26 @@ ok(docs.parse_table([['주택형', '전용면적', '전세대 보증금(원)'], 
 ut = docs.parse_table([['공급대상', '전용면적', '임대보증금', '월임대료'], ['청년', '20.5', '1,000', '30'], ['신혼부부', '40.1', '3,000', '50'],
                        ['고령자', '20.5', '500', '10'], ['청년·신혼부부', '30.5', '2,000', '40']])
 ok([u['target'] for u in ut] == ['청년', '신혼부부', '기타', '공통'], f"공급대상 열 → 청년/신혼부부/기타/공통 {[u['target'] for u in ut]}")
+# 14b 알림 이름: 단지명/사업명 정리, 여러 단지 사업은 최적 주택형의 단지명
+nn = lambda src, t: report.notice_name(dict(source=src, title=t))[:3]
+ok(nn('soco', '[민간임대] 동묘앞역 청계로벤하임 추가모집공고') == ('청계로벤하임', None, '동묘앞역')
+   and nn('sh', '2026년 재개발임대주택 일반모집 공고(2026. 9. 9.)')[0] == 'SH 재개발임대 일반모집'
+   and nn('sh', '[토지임대부 사회주택] 쌍문생활 302호 입주자 모집 공고문')[0] == '쌍문생활'
+   and nn('sh', '[청년형] 특화형 매입임대주택(금천구) 입주자 모집 공고(운영기관 : 한지붕 협동조합)')[:2] == ('SH 특화형 매입임대', '금천구')
+   and nn('sh', '[청년형] 특화형 매입임대주택 입주자 모집 공고(운영기관 : 한지붕 협동조합)')[0] == 'SH 특화형 매입임대 (한지붕 협동조합)'
+   and nn('lh', '2026년 청년 전세임대 1순위 입주자 수시모집')[0] == 'LH 청년 전세임대'
+   and nn('sh', '2026년 신정도시마을 잔여세대 입주자모집공고(26. 9. 23.)')[0] == '신정도시마을', '알림 이름: 접두어·날짜·모집공고 제거, 역/구 분리, 사업명은 기관 접두')
+ok(report.notice_name(dict(source='sh', title='x 공고', name='사람기록단지'))[0] == '사람기록단지', '알림 이름: item_meta 단지명 우선')
+ok(report.unit_place('강동구 서도휴빌(2차) 102동 42C 강동구 성내동 440-26 둔촌동역 O X 보증금50%') == ('서도휴빌(2차)', '강동구', '둔촌동역')
+   and report.unit_place('DMC래미안e편한세상(가재울뉴타운3) 최대전환')[0] == 'DMC래미안e편한세상(가재울뉴타운3)'
+   and report.unit_place('row1') is None and report.unit_place('29.98㎡') is None and report.unit_place('일반 공급 청년 20A㎡ (910호)') is None,
+   '주택형 라벨 → 단지명·구·역 (표 잔해는 무시)')
+it = report._item(dict(title='2026년 재개발임대주택 일반모집 공고(2026. 9. 9.)', source='sh', url='u', apply_start=None, apply_end=None, elig_note='세대 기준 공고(무주택세대구성원 등) — 자격 원문 확인',
+                       reason_monthly='[자동추출] 동소문한진 562/6.63만원', best_json=json.dumps({'monthly': dict(unit_label='동소문한진', area_m2=32.49, deposit=562, rent=6.63)})),
+                  'monthly', cb, show_target=False)
+ok(it.split('\n') == ['• 🏠 **[SH 재개발임대 일반모집](u)**', '  - 동소문한진 · 32.49㎡', '  - 보증금 562만 / 월세 6.63만 · 자동추출', '  - 무주택세대 자격'],
+   f'알림 항목: 사업명 링크 + 단지명 첫 줄 + 압축 자격, 모르는 접수기간 줄 생략 {it!r}')
+
 # 15 전세 판정
 J = lambda l, d, t='공통', r=0, o='human': dict(unit_label=l, area_m2=59, deposit=d, rent=r, target=t, origin=o, lease_type='jeonse' if not r else 'monthly')
 ok(hdb.judge_jeonse([J('a', 20000)], {}, False, cb)[0] == 'match', '전세 경계값(=2억) match')
@@ -254,6 +282,9 @@ md1 = report.render_chat(cd='2026-10-06', cfg=cy, blocks={'monthly': bm}, suppor
 ok(md1.split('\n')[0] == '**서울 청년 월세 수집** · 2026-10-06' and '**월세**' not in md1 and '· 청년' not in md1 and md1.split('\n')[1] == '월세 부합 1',
    '채팅: 대상 1개·유형 1개 → 블록 제목·대상 태그 없음(승인 템플릿)')
 ok(report.render_chat(cd='d', cfg=cy, blocks={'monthly': {}}) == '**알릴 것 없음**', '채팅: 알릴 것 없음')
+items_md = [b_ for b_ in md.split('\n• ')[1:]]
+ok(all(sum(1 for x in b_.split('\n') if x.startswith('  - ')) <= 3 for b_ in items_md) and '원문 확인' not in md and '[SH 청년 매입임대](u3)' in md,
+   '채팅: 항목당 하위 줄 ≤3, 자리표시 문구 없음, 링크 텍스트 = 짧은 이름')
 ok(report.man(18410) == '1억 8,410만' and report.man(2000) == '2,000만' and report.man(20000) == '2억' and report.man(87.5) == '87.5만', '금액 표기(억·만)')
 sources.ALL = orig
 # 17 스키마 마이그레이션 멱등 (재연결 시 컬럼 중복 추가 없음)
