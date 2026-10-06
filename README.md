@@ -85,4 +85,4 @@ Full design, schema, alert template and limitations: [`DESIGN.md`](DESIGN.md).
 
 ## License
 
-No license has been chosen yet — the repository owner should pick one (until then, default copyright applies).
+MIT License. See [LICENSE](LICENSE).
