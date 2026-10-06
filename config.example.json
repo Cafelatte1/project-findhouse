@@ -1,0 +1,19 @@
+{
+  "_readme": "Example settings. Copy to config.json and adjust before the first run (ask the end user for their budget, excluded districts and schedule). Money unit: 만원 (10,000 KRW).",
+  "_comment_match": "match: any unit type / deposit-ratio option with deposit <= max_deposit_manwon AND rent <= max_rent_manwon. near: not match, but deposit <= max + near_tolerance_deposit AND rent <= max + near_tolerance_rent.",
+  "max_deposit_manwon": 3000,
+  "max_rent_manwon": 50,
+  "near_tolerance_deposit_manwon": 3000,
+  "near_tolerance_rent_manwon": 10,
+  "exclude_gu": [],
+  "_help_exclude_gu": "Districts (자치구) to exclude from matching, e.g. [\"OO구\"]. Empty list = no exclusion.",
+  "due_soon_days": 3,
+  "soco_assumed_window_days": 3,
+  "_help_soco_assumed_window_days": "If the 청년안심주택 list shows no closing date, assume the application window lasts this many days.",
+  "http_timeout_sec": 40,
+  "http_retries": 2,
+  "pages": {"sh": 5, "seoulportal": 2, "soco": 2, "lh_lookback_days": 60, "socialhousing": 1},
+  "socialhousing_max_age_days": 60,
+  "docs": {"enabled": true, "ocr": false, "max_items_per_run": 20, "max_files_per_item": 4, "ocr_max_pages": 12},
+  "_help_docs": "Attachment extraction for new/unpriced notices. Text PDFs (pdfplumber) and HWP (rhwp-python) tables are parsed automatically. ocr=false (default): image-only notices are rendered to page PNGs and left for the agent to read (status needs_agent). ocr=true enables experimental tesseract OCR (results marked unverified)."
+}

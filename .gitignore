@@ -1,0 +1,23 @@
+# local settings & data (personal budget / exclusions live only in config.json)
+config.json
+housing.db
+housing.db-*
+*.sqlite*
+# virtualenv / caches
+venv/
+.venv/
+__pycache__/
+*.pyc
+# downloaded attachments, rendered pages, OCR crops, raw HTML, logs
+docs/
+raw/
+cache/
+downloads/
+images/
+logs/
+*.log
+*.bak
+# never commit secrets
+.env
+*.pem
+*.key

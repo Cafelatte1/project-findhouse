@@ -1,0 +1,9 @@
+# Pinned from the working environment (Python 3.13). Transitive deps resolve automatically.
+pdfplumber==0.11.10      # text-PDF tables (pulls pdfminer.six, pypdfium2)
+pillow==12.3.0           # page images / crops
+playwright==1.63.0       # headless Chromium for the JS-rendered 청년안심주택 (soco) board
+rhwp-python==0.8.1       # primary HWP/HWPX table parser
+# HWP fallback (hwp5html) — optional; used only if rhwp-python fails to load
+pyhwp==0.1b15
+six==1.17.0
+lxml==6.1.3

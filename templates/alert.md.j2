@@ -1,0 +1,21 @@
+{# 참고용 Jinja 스케치 — 실제 렌더는 report.py (의존성 0). #}
+# 서울 청년 월세 임대 알림 — {{ cd }} (KST)
+
+| 항목 | 값 |
+|---|---|
+| 부합 기준 | 보증금 ≤ **{{ max_deposit }}만원**, 월세 ≤ **{{ max_rent }}만원** |
+| 근소초과 | ≤ {{ near_deposit }}만 / ≤ {{ near_rent }}만 |
+| 수집 | `{{ counts }}` |
+| 소요 | **{{ elapsed }}s** |
+
+{% for key, rows in sections if rows %}
+## {{ titles[key] }} ({{ rows|length }}건)
+{% for r in rows %}
+- **[{{ r.name or r.title }}]({{ r.url }})**
+  - 위치: {{ r.gu }} · {{ r.station }} · 전용 {{ r.area_m2 }}㎡ · {{ r.deposit }}만 / {{ r.rent }}만
+  - 접수: {{ r.apply_start }} ~ {{ r.apply_end }} · 상태: {{ r.status }}
+  - 판정: {{ r.fit_basis }} — {{ r.fit_reason }}
+{% endfor %}
+{% else %}
+**알릴 것 없음**
+{% endfor %}
