@@ -14,7 +14,10 @@ UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Sa
 SUPPORTED = ('sh', 'soco', 'socialhousing')
 FORM = re.compile(r'신청서|서약서|동의서|양식|서식|체크리스트|별지|위임장|확인서|제출서류|평면도|배치도')
 MONEY_COLS_BAD = re.compile(r'계약금|잔금|중도금|관리비')
-PARSER_VERSION = '2.0'   # 파서/구조화 스키마 버전 — 바뀌면 sha256 캐시 무효화
+JEONSE_HDR = re.compile(r'전세(?!대)')          # 표 헤더/제목의 전세 신호 ('전세대'=전 세대 제외). 본문 키워드는 쓰지 않음
+TARGET_COL = re.compile(r'공급\s*대상|입주\s*대상|모집\s*대상|공급\s*유형|계층')
+OTHER_TARGET = re.compile(r'고령|주거급여|수급자')
+PARSER_VERSION = '2.1'   # 2.1: 전세(보증금 단독) 표·공급대상 열·고령자 행 분리   # 파서/구조화 스키마 버전 — 바뀌면 sha256 캐시 무효화
 # FreeType: rhwp-python 번들 libfreetype 이 FT_Palette_Data_Get 심볼이 비어 시스템 lib 를 먼저 로드
 def _preload_freetype():
     import ctypes
@@ -101,7 +104,8 @@ def area_of(cell):
     return v if v and 5 <= v <= 200 else None
 
 # ---------------------------------------------------------------- 표 → 주택형
-def parse_table(rows, page_text='', heading='', area_by_room=None):
+def parse_table(rows, page_text='', heading='', area_by_room=None, jeonse=False):
+    """임대료 표 → units. jeonse=True(전세 공고) 이거나 헤더에 '전세'가 있으면 월세 열 없는 보증금 단독 표도 rent=0, lease_type=jeonse 로."""
     rows = [[(c if c is None else str(c)) for c in r] for r in rows if r]
     if len(rows) < 2: return []
     ncol = max(len(r) for r in rows); rows = [r + [None] * (ncol - len(r)) for r in rows]
@@ -118,18 +122,23 @@ def parse_table(rows, page_text='', heading='', area_by_room=None):
         if MONEY_COLS_BAD.search(lab): continue
         prim = last[j] or lab
         if re.search(r'임대료|월세|사용료', prim): kind[j] = 'rent'
-        elif '보증금' in prim: kind[j] = 'dep'
+        elif '보증금' in prim or re.search(r'전세금', prim): kind[j] = 'dep'
         elif re.search(r'임대료|월세|사용료', lab): kind[j] = 'rent'
-        elif '보증금' in lab: kind[j] = 'dep'
+        elif '보증금' in lab or re.search(r'전세금', lab): kind[j] = 'dep'
     deps = [j for j in kind if kind[j] == 'dep']; rents = [j for j in kind if kind[j] == 'rent']
-    if not deps or not rents: return []
-    pairs, used = [], set()
-    for d in deps:
-        r = next((r for r in rents if r > d and r not in used), None)
-        if r is not None: used.add(r); pairs.append((d, r))
+    if not deps: return []
+    if not rents:                                # 보증금 단독 표 = 전세 표일 때만 인정 (계약금 표 등은 위에서 제외)
+        if not (jeonse or JEONSE_HDR.search(' '.join(labels) + ' ' + (heading or ''))): return []
+        pairs = [(deps[0], None)]
+    else:
+        pairs, used = [], set()
+        for d in deps:
+            r = next((r for r in rents if r > d and r not in used), None)
+            if r is not None: used.add(r); pairs.append((d, r))
     area_col = next((j for j, l in enumerate(labels) if '전용' in l and '평' not in l and '공용' not in l and j not in kind), None)
     room_col = next((j for j, l in enumerate(labels) if re.search(r'호수|호실|공실', l) and j not in kind and j != area_col), None)
     sup_col = next((j for j, l in enumerate(labels) if re.search(r'공급\s*호수|모집\s*호수|세대수|공급\s*세대|금회', l) and j not in kind and j != area_col), None)
+    tgt_col = next((j for j, l in enumerate(labels) if j >= 2 and TARGET_COL.search(l) and j not in kind and j not in (area_col, sup_col)), None)
     hint = page_unit(page_text)
     out, prev, sup_vals, total = [], None, [], None
     for r in rows[first:]:
@@ -139,8 +148,12 @@ def parse_table(rows, page_text='', heading='', area_by_room=None):
             continue
         if prev is not None: r = [prev[j] if r[j] is None else r[j] for j in range(ncol)]   # 세로 병합 셀 승계
         prev = r
-        tcells = ' '.join((r[j] or '') for j in range(min(2, ncol)))
-        target = '신혼부부' if ('신혼' in tcells and '청년' not in tcells) else ('청년' if '청년' in tcells else '공통')
+        tcells = ' '.join((r[j] or '') for j in range(min(2, ncol))) + (' ' + (r[tgt_col] or '') if tgt_col is not None else '')
+        if '신혼' in tcells and '청년' in tcells: target = '공통'            # '청년 또는 신혼부부' 행
+        elif '신혼' in tcells: target = '신혼부부'
+        elif '청년' in tcells: target = '청년'
+        elif OTHER_TARGET.search(tcells): target = '기타'                    # 고령자·주거급여 등 — 판정 대상 아님
+        else: target = '공통'
         area = area_of(r[area_col]) if area_col is not None else None
         if area is None and area_by_room and room_col is not None:
             area = area_by_room.get(re.sub(r'\D', '', r[room_col] or ''))
@@ -154,18 +167,19 @@ def parse_table(rows, page_text='', heading='', area_by_room=None):
             lab_parts.append(c)
         base = ' '.join(dict.fromkeys(lab_parts))[:60]
         for d, rc in pairs:
-            dv, rv = num(r[d]), num(r[rc])
+            dv = num(r[d]); rv = num(r[rc]) if rc is not None else 0
             if dv is None or rv is None: continue
-            dep = to_manwon(dv, col_unit(labels[d]), 'dep', hint); rent = to_manwon(rv, col_unit(labels[rc]), 'rent', hint)
-            if not (50 <= dep <= 200000 and 0.3 <= rent <= 600): continue
-            opt = re.search(r'(\d{2,3})\s*%', labels[d] + ' ' + labels[rc])
+            dep = to_manwon(dv, col_unit(labels[d]), 'dep', hint)
+            rent = to_manwon(rv, col_unit(labels[rc]), 'rent', hint) if rc is not None else 0
+            if not (50 <= dep <= 200000 and (rc is None or 0.3 <= rent <= 600)): continue
+            opt = re.search(r'(\d{2,3})\s*%', labels[d] + ' ' + (labels[rc] if rc is not None else ''))
             conv = '최대전환' if '전환' in labels[d] else ''
             if not base and area: base = f'{area:g}㎡'
             lbl = ' '.join(x for x in ((f'[{heading}]' if heading else ''), base, (f'보증금{opt.group(1)}%' if opt else ''), conv) if x)
             opt_s = (f'보증금{opt.group(1)}%' if opt else '') + ((' ' + conv) if conv else '')
             out.append(dict(unit_label=lbl or f'row{len(out)+1}', target=target, area_m2=area, deposit=dep, rent=rent, supply=sup,
-                            option=opt_s.strip() or None,
-                            note=f"원표 {r[d]!s}/{r[rc]!s}".replace('\n', ' ')))
+                            option=opt_s.strip() or None, lease_type='jeonse' if rc is None else 'monthly',
+                            note=(f"원표 {r[d]!s}/{r[rc]!s}" if rc is not None else f"원표 전세 {r[d]!s}").replace('\n', ' ')))
     ok_sup = total is not None and sup_vals and all(v is not None for v in sup_vals) and abs(sum(sup_vals) - total) < 0.5
     for u in out:
         if not ok_sup: u['supply'] = None
@@ -196,11 +210,12 @@ def _room_area_map(tables):
     return m
 
 # ---------------------------------------------------------------- 추출기
-def extract_pdf_text(path, page_outdir=None):
+def extract_pdf_text(path, page_outdir=None, jeonse=False):
     """텍스트 PDF: pdfplumber 표 + 해당 페이지 PNG 렌더 + 구조화용 page/bbox 필드."""
     import pdfplumber
     full = subprocess.run(['pdftotext', '-layout', str(path), '-'], capture_output=True).stdout.decode('utf-8', 'ignore').split('\f')
-    pages = [i for i, t in enumerate(full) if '보증금' in t and re.search(r'임대료|월세|사용료', t)][:12]
+    rx = r'임대료|월세|사용료|전세(?!대)' if jeonse else r'임대료|월세|사용료'   # 전세 공고일 때만 전세 표 페이지 추가 선택
+    pages = [i for i, t in enumerate(full) if '보증금' in t and re.search(rx, t)][:12]
     tabs = []
     with pdfplumber.open(str(path)) as pdf:
         for i in pages:
@@ -213,7 +228,7 @@ def extract_pdf_text(path, page_outdir=None):
                 tabs.append((t.extract(), full[i], h, i + 1, ti, [round(x0,1), round(top,1), round(x1,1), round(bot,1)]))
     rmap = _room_area_map([t[0] for t in tabs]); us = []
     for rows, txt, h, pg, ti, bbox in tabs:
-        for u in parse_table(rows, txt, h, rmap):
+        for u in parse_table(rows, txt, h, rmap, jeonse=jeonse):
             u['page'] = pg; u['table_index'] = ti; u['bbox'] = bbox; us.append(u)
     _fill_single_area(us, [t[0] for t in tabs])
     us = _dedup_units(us)
@@ -258,7 +273,7 @@ def build_structured(*, kind, method, units, info, text='', page_images=None, ta
     us = []
     for u in units:
         us.append(dict(unit_label=u.get('unit_label'), target=u.get('target'), area_m2=u.get('area_m2'),
-                       deposit=u.get('deposit'), rent=u.get('rent'), supply=u.get('supply'),
+                       deposit=u.get('deposit'), rent=u.get('rent'), supply=u.get('supply'), lease_type=u.get('lease_type'),
                        option=u.get('option'), page=u.get('page'), table_index=u.get('table_index'),
                        bbox=u.get('bbox'), page_image=(page_images or {}).get(u.get('page')),
                        note=u.get('note')))
@@ -316,7 +331,7 @@ def _rhwp_tables(path):
         tabs.append(grid)
     return tabs, txt
 
-def extract_hwp(path, kind):
+def extract_hwp(path, kind, jeonse=False):
     """HWP/HWPX: rhwp-python 우선, 실패 시 hwp5html(HWP) / section XML(HWPX)."""
     method = None; tabs = []; txt = ''
     try:
@@ -345,7 +360,7 @@ def extract_hwp(path, kind):
     rent_tabs = [t for t in tabs if '보증금' in ' '.join(str(c) for r in t for c in r if c)]
     rmap = _room_area_map(rent_tabs); us = []
     for ti, t in enumerate(rent_tabs):
-        for u in parse_table(t, txt):
+        for u in parse_table(t, txt, jeonse=jeonse):
             u['table_index'] = ti; us.append(u)
     us = _dedup_units(us)
     info = dict(tables=len(rent_tabs), method=method, rhwp=bool(method == 'rhwp'))
@@ -406,10 +421,11 @@ def render_pages_for_agent(path, kind, outdir, max_pages=12):
 def _now(): return dt.datetime.now(hdb.KST).isoformat(timespec='seconds')
 def save_units(con, src, iid, origin, units, doc_id):
     for u in units:
-        con.execute('INSERT OR REPLACE INTO units(source,item_id,unit_label,target,area_m2,deposit,rent,note,origin,verified,supply,doc_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (src, iid, u['unit_label'], u['target'], u['area_m2'], u['deposit'], u['rent'], u.get('note'), origin, 0, u.get('supply'), doc_id))
+        con.execute('INSERT OR REPLACE INTO units(source,item_id,unit_label,target,area_m2,deposit,rent,note,origin,verified,supply,doc_id,lease_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (src, iid, u['unit_label'], u['target'], u['area_m2'], u['deposit'], u['rent'], u.get('note'), origin, 0, u.get('supply'), doc_id,
+                     u.get('lease_type') or ('jeonse' if not u['rent'] else 'monthly')))
 
-def process_file(con, src, iid, f, cfg, force_ocr=False):
+def process_file(con, src, iid, f, cfg, force_ocr=False, lease_hint=None):
     name = f['name']; d = DOCS / src / iid; d.mkdir(parents=True, exist_ok=True)
     row = dict(source=src, item_id=iid, file_url=f['url'], file_name=name, processed_at=_now(), verified='auto', parser_version=PARSER_VERSION)
     if FORM.search(name) and not re.search(r'공고', name):
@@ -442,9 +458,10 @@ def process_file(con, src, iid, f, cfg, force_ocr=False):
     try:
         page_dir = d / (safe + '_pages')
         if kind == 'pdf-text' and not force_ocr:
-            us, info, structured = extract_pdf_text(p, page_outdir=page_dir); method, origin = 'pdfplumber', 'auto'
+            kw = {'jeonse': True} if lease_hint == 'jeonse' else {}
+            us, info, structured = extract_pdf_text(p, page_outdir=page_dir, **kw); method, origin = 'pdfplumber', 'auto'
         elif kind in ('hwp', 'hwpx'):
-            us, info, structured = extract_hwp(p, kind); method, origin = info.get('method') or ('hwp5html' if kind == 'hwp' else 'hwpx-xml'), 'auto'
+            us, info, structured = extract_hwp(p, kind, **({'jeonse': True} if lease_hint == 'jeonse' else {})); method, origin = info.get('method') or ('hwp5html' if kind == 'hwp' else 'hwpx-xml'), 'auto'
         elif kind in ('pdf-image', 'image') and not (cfg.get('docs', {}).get('ocr') or force_ocr):
             us, info, structured = render_pages_for_agent(p, kind, page_dir, cfg.get('docs', {}).get('ocr_max_pages', 12)); method, origin = 'none', 'ocr'
             info['units'] = 0; info['sample'] = []
@@ -471,7 +488,7 @@ def upsert_doc(con, row):
                 + ','.join(f'{c}=excluded.{c}' for c in cols[3:]), [row.get(c) for c in cols])
     return con.execute('SELECT doc_id FROM documents WHERE source=? AND item_id=? AND file_url=?', (row['source'], row['item_id'], row['file_url'])).fetchone()[0]
 
-def process_item(con, src, iid, url, cfg, force=False, force_ocr=False):
+def process_item(con, src, iid, url, cfg, force=False, force_ocr=False, lease_hint=None):
     """한 공고의 첨부 전체 처리. 이미 처리 기록이 있으면(force 아니면) 네트워크 없이 skip. returns summary dict"""
     if not force:
         rows = list(con.execute('SELECT parser_version, status FROM documents WHERE source=? AND item_id=?', (src, iid)))
@@ -484,7 +501,7 @@ def process_item(con, src, iid, url, cfg, force=False, force_ocr=False):
     con.execute("DELETE FROM units WHERE source=? AND item_id=? AND origin IN ('auto','ocr')", (src, iid))
     res, used = [], set()
     for f in files[:cfg.get('docs', {}).get('max_files_per_item', 4)]:
-        try: row, us = process_file(con, src, iid, f, cfg, force_ocr)
+        try: row, us = process_file(con, src, iid, f, cfg, force_ocr, lease_hint)
         except Exception as e:
             row, us = dict(source=src, item_id=iid, file_url=f['url'], file_name=f['name'], status='error', error=f'{type(e).__name__}: {e}'[:300], processed_at=_now()), []
         did = upsert_doc(con, row)

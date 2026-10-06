@@ -1,21 +1,30 @@
-{# 참고용 Jinja 스케치 — 실제 렌더는 report.py (의존성 0). #}
-# 서울 청년 월세 임대 알림 — {{ cd }} (KST)
+{# 참고용 Jinja 스케치 — 실제 렌더는 report.render_chat (의존성 0). 카드형 레거시는 report.render_alert(--format cards). #}
+**서울 {{ targets_label }} {{ types_label }} 수집** · {{ cd }}
+{{ summary_line }}{# 예: 월세 부합 2 · 근소 1 / 전세 부합 1 #}
+{% for lease, secs in blocks.items() if secs.values()|select|list %}
+{% if blocks|length > 1 %}**{{ lease_label[lease] }}**{% endif %}
+{% if lease == 'monthly' %}• 기준: 보증금 ≤{{ man(max_deposit) }} · 월세 ≤{{ man(max_rent) }}{% else %}• 기준: 전세 보증금 ≤{{ man(jeonse_max_deposit) }}{% endif %}
+{% for key, title in [('match','✅ **조건 부합**'),('near','⚠️ **근소 초과**'),('due','⚠️ **마감 임박**'),('notice','⚠️ **공고 단위 확인**'),('unknown','⚠️ **가격 미확인**'),('unverified','⚠️ **OCR 미검증**')] if secs[key] %}
 
-| 항목 | 값 |
-|---|---|
-| 부합 기준 | 보증금 ≤ **{{ max_deposit }}만원**, 월세 ≤ **{{ max_rent }}만원** |
-| 근소초과 | ≤ {{ near_deposit }}만 / ≤ {{ near_rent }}만 |
-| 수집 | `{{ counts }}` |
-| 소요 | **{{ elapsed }}s** |
+{{ title }} ({{ secs[key]|length }})
 
-{% for key, rows in sections if rows %}
-## {{ titles[key] }} ({{ rows|length }}건)
-{% for r in rows %}
-- **[{{ r.name or r.title }}]({{ r.url }})**
-  - 위치: {{ r.gu }} · {{ r.station }} · 전용 {{ r.area_m2 }}㎡ · {{ r.deposit }}만 / {{ r.rent }}만
-  - 접수: {{ r.apply_start }} ~ {{ r.apply_end }} · 상태: {{ r.status }}
-  - 판정: {{ r.fit_basis }} — {{ r.fit_reason }}
-{% endfor %}
-{% else %}
-**알릴 것 없음**
-{% endfor %}
+{% for r in secs[key] %}
+• 🏠 **[{{ r.name or r.title }}]({{ r.url }})**{% if both_targets and r.target %} · {{ r.target }}{% endif %}
+  - {{ r.gu }} · {{ r.station }} · {{ r.area_m2 }}㎡
+  - {% if r.conv %}🔁 전환 · {% endif %}{% if lease == 'jeonse' and not r.conv %}전세 {{ man(r.deposit) }}{% else %}보증금 {{ man(r.deposit) }} / 월세 {{ man(r.rent) }}{% endif %}
+  - 접수 {{ r.apply_start }} ~ {{ r.apply_end }}{% if r.is_due_soon %} · 마감 임박{% endif %}
+{% if r.elig_note %}  - 자격: {{ r.elig_note }}{% endif %}
+{% endfor %}{% endfor %}{% endfor %}
+{% if support %}
+
+📋 **지원 프로그램** ({{ support|length }})
+{% for r in support %}
+• [{{ r.title }}]({{ r.url }})
+  - 접수 ~ {{ r.apply_end }} · 입주자가 주택을 구해 신청 · 가격 판정 없음
+{% endfor %}{% endif %}
+{% if fails %}
+
+⚠️ **수집 장애** ({{ fails|length }})
+{% for k, v in fails.items() %}• {{ k }}: {{ v }}
+{% endfor %}{% endif %}
+{# 알릴 것이 없으면: **알릴 것 없음** #}

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """수집 결과 마크다운 템플릿. run_daily / query.py 공통.
-  from report import render_alert, render_listing_card, BASIS_LABEL
+  render_chat  : 채팅 알림(기본) — 한 줄 요약 + 임대유형별 블록(월세/전세) + 📋 지원 프로그램 + 수집 장애
+  render_alert : 카드형(레거시, --format cards)
+  from report import render_chat, render_alert, render_listing_card, BASIS_LABEL
 """
 from __future__ import annotations
 import json, re
@@ -124,4 +126,143 @@ def render_query(cd, rows, *, title=None):
         lst = by.get(k) or []
         if not lst: continue
         out += [f'## {k} ({len(lst)}건)', ''] + [render_listing_card(r, show_fit=True) for r in lst] + ['']
+    return '\n'.join(out)
+
+
+# ───────────────────────── 채팅 알림 (기본) ─────────────────────────
+LEASE_LABEL = {'monthly': '월세', 'jeonse': '전세'}
+TARGET_LABEL = {'youth': '청년', 'newlywed': '신혼부부'}
+CHAT_SECTION = [            # (키, 제목, 요약줄 라벨)
+    ('match', '✅ **조건 부합**', '부합'),
+    ('near', '⚠️ **근소 초과**', '근소'),
+    ('due', '⚠️ **마감 임박**', '마감 임박'),
+    ('notice', '⚠️ **공고 단위 확인**', '공고'),          # HUG 든든전세 등: 주택별 가격은 공고 원문(호수·보증금 규칙·기간만)
+    ('unknown', '⚠️ **가격 미확인**', '가격 미확인'),
+    ('unverified', '⚠️ **OCR 미검증**', '미검증'),
+]
+
+def man(v):
+    """만원 금액 → '1억 8,410만' / '2,000만' / '87.5만'."""
+    if v is None: return '확인 필요'
+    v = float(v)
+    if v >= 10000:
+        eok = int(v // 10000); rest = round(v - eok * 10000, 1)
+        return f'{eok}억' + (f' {rest:,g}만' if rest else '')
+    return f'{v:,g}만'
+
+def _best(r, lease):
+    try: return (json.loads(r.get('best_json') or '{}') or {}).get(lease)
+    except Exception: return None
+
+def _conv_like(b, cfg):
+    j = cfg.get('jeonse') or {}
+    return bool(b and b.get('rent') and b['rent'] <= j.get('jeonse_like_max_rent_manwon', 10)
+                and b['deposit'] >= j.get('jeonse_like_min_deposit_manwon', 5000))
+
+def _price_line(r, lease, cfg):
+    b = _best(r, lease)
+    if not b:
+        if lease == 'monthly' and r.get('deposit') is not None and r.get('rent'):
+            b = dict(deposit=r['deposit'], rent=r['rent'], area_m2=r.get('area_m2'))
+        else: return None
+    reason = r.get('reason_monthly' if lease == 'monthly' else 'reason_jeonse') or ''
+    opt = option_note(dict(fit_reason=reason))
+    if lease == 'jeonse' and b.get('conv'):
+        s = f"🔁 전환 · 보증금 {man(b['deposit'])} / 월세 {man(b['rent'])}"
+    elif lease == 'jeonse':
+        s = f"전세 {man(b['deposit'])}"
+    else:
+        s = f"보증금 {man(b['deposit'])} / 월세 {man(b['rent'])}"
+        if _conv_like(b, cfg): s = '🔁 전환 · ' + s
+    if opt: s += f' ({opt})'
+    if '[자동추출]' in reason: s += ' · 원문 확인 권장'
+    return s
+
+def _loc_line(r, lease):
+    b = _best(r, lease) or {}
+    area = b.get('area_m2') or (r.get('area_m2') if lease == 'monthly' or not r.get('best_json') else None)
+    parts = [x for x in ((r.get('gu') or '').strip(), (r.get('station') or '').strip()) if x]
+    if area: parts.append(f'{area:g}㎡')
+    return ' · '.join(parts)
+
+def _period(r):
+    a, b = r.get('apply_start'), r.get('apply_end')
+    if not a and not b: return '접수 기간 원문 확인'
+    return f"접수 {a + ' ' if a else ''}~{' ' + b if b else ''}"
+
+def _item(r, lease, cfg, *, show_target):
+    name = r.get('name') or (r.get('title') or '')[:50]
+    head = f"• 🏠 **[{name}]({r['url']})**" if r.get('url') else f'• 🏠 **{name}**'
+    if show_target:      # 대상이 둘 다 선택된 경우만: 판정된 주택형의 공급대상 > 공고 제목 표기
+        bt = (_best(r, lease) or {}).get('target')
+        tg = bt if bt in TARGET_LABEL.values() else r.get('targets')
+        if tg: head += f' · {tg}'
+    lines = [head]
+    loc_s = _loc_line(r, lease)
+    if loc_s: lines.append(f'  - {loc_s}')
+    pl = _price_line(r, lease, cfg)
+    if pl: lines.append(f'  - {pl}')
+    if r.get('extra_note'): lines.append(f"  - {r['extra_note']}")
+    per = _period(r)
+    if r.get('is_due_soon'): per += ' · 마감 임박'
+    lines.append(f'  - {per}')
+    if r.get('elig_note'): lines.append(f"  - 자격: {r['elig_note']}")
+    crops = []
+    for cs in r.get('crops') or []: crops += cs if isinstance(cs, list) else [cs]
+    if crops: lines.append(f"  - 이미지: {', '.join(str(c) for c in crops[:4])}")
+    return '\n'.join(lines)
+
+def _criteria(lease, cfg):
+    if lease == 'monthly':
+        return f"• 기준: 보증금 ≤{man(cfg['max_deposit_manwon'])} · 월세 ≤{man(cfg['max_rent_manwon'])}"
+    j = cfg['jeonse']
+    return f"• 기준: 전세 보증금 ≤{man(j['max_deposit_manwon'])}"
+
+def chat_title(cfg):
+    tg = '·'.join(TARGET_LABEL[t] for t in ('youth', 'newlywed') if t in (cfg.get('targets') or ['youth']))
+    lt = '·'.join(LEASE_LABEL[t] for t in ('monthly', 'jeonse') if t in (cfg.get('lease_types') or ['monthly']))
+    return f'서울 {tg} {lt} 수집'
+
+def summary_line(blocks, support, fails):
+    parts = []
+    for lease, secs in blocks.items():
+        cnt = [f'{lab} {len(secs.get(k) or [])}' for k, _, lab in CHAT_SECTION if secs.get(k)]
+        if cnt: parts.append(f'{LEASE_LABEL[lease]} ' + ' · '.join(cnt))
+    if support: parts.append(f'지원 프로그램 {len(support)}')
+    if fails: parts.append(f'수집 장애 {len(fails)}')
+    return ' / '.join(parts)
+
+def render_chat(*, cd, cfg, blocks, support=None, fails=None, quiet_msg='**알릴 것 없음**'):
+    """blocks: {'monthly': {'match': rows, 'near': rows, 'due': rows, 'unknown': rows, 'unverified': rows}, 'jeonse': {...}}
+    선택한 임대유형 순서(월세→전세)로, 내용이 있는 블록만 출력. 블록마다 자체 기준줄과 ✅/⚠️ 섹션.
+    대상 태그는 대상이 둘 다 선택된 경우에만 붙인다. 알릴 것이 없으면 quiet_msg만."""
+    support = support or []; fails = fails or {}
+    order = [t for t in ('monthly', 'jeonse') if t in (cfg.get('lease_types') or ['monthly'])]
+    blocks = {t: blocks.get(t) or {} for t in order if any(blocks.get(t, {}).values())}
+    if not blocks and not support and not fails: return quiet_msg
+    show_target = len(cfg.get('targets') or ['youth']) > 1
+    out = [f'**{chat_title(cfg)}** · {cd}', summary_line(blocks, support, fails)]
+    multi = len(order) > 1
+    for lease, secs in blocks.items():
+        out.append('')
+        if multi: out.append(f'**{LEASE_LABEL[lease]}**')
+        out.append(_criteria(lease, cfg))
+        if lease == 'jeonse' and any((_best(r, 'jeonse') or {}).get('conv') for k in ('match', 'near') for r in secs.get(k) or []):
+            j = cfg['jeonse']
+            out.append(f"• 🔁 전환: 월세 ≤{man(j['jeonse_like_max_rent_manwon'])} · 보증금 ≥{man(j['jeonse_like_min_deposit_manwon'])} 옵션도 전세 기준으로 판정")
+        for key, title, _ in CHAT_SECTION:
+            rows = secs.get(key) or []
+            if not rows: continue
+            out += ['', f'{title} ({len(rows)})', '']
+            out += [_item(r, lease, cfg, show_target=show_target) for r in rows]
+    if support:
+        out += ['', f'📋 **지원 프로그램** ({len(support)})', '']
+        for r in support:
+            name = (r.get('title') or '')[:60]
+            head = f"• [{name}]({r['url']})" if r.get('url') else f'• {name}'
+            per = _period(r) + (' · 마감 임박' if r.get('is_due_soon') else '')
+            if r.get('extra_note'): per += f" · {r['extra_note']}"
+            out += [head, f'  - {per}', '  - 입주자가 주택을 구해 신청 · 가격 판정 없음']
+    if fails:
+        out += ['', f'⚠️ **수집 장애** ({len(fails)})', ''] + [f'• {k}: {str(v)[:160]}' for k, v in fails.items()]
     return '\n'.join(out)

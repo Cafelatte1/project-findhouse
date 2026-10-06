@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """오프라인 자가점검 (네트워크·개인 설정 불필요). 임시 DB·임시 config 를 쓰므로 실제 housing.db/config.json 을 건드리지 않음.
 점검: 판정 로직, 단위 변환, 중복제거, 소스 실패 격리, 같은날 재실행 멱등성, 재게시 승계, 첨부 표 파서,
-      판정 근거(basis), LH 구조 변경 감지, documents sha256/parser_version 캐시, 이미지 공고(OCR 끔) 처리, 리포트 템플릿.
+      판정 근거(basis), LH 구조 변경 감지, documents sha256/parser_version 캐시, 이미지 공고(OCR 끔) 처리, 리포트 템플릿,
+      임대유형(월세/전세)·대상(청년/신혼부부) 축: 설정 하위호환, 관련성 동치(구 규칙), 전세 표 파서, 공급대상 열, 전세 판정·🔁 전환,
+      혼합 공고의 블록별 판정, 알림 태그, 스키마 마이그레이션 멱등, 채팅 블록 렌더, HUG 공고 파싱, 서울주거포털 주석 제거.
 사용: python selftest.py   (실패가 있으면 exit 1)"""
 import tempfile, shutil, json, sys
 from pathlib import Path
-import hdb, sources, collect, docs, units, report
+import re
+import hdb, sources, collect, docs, units, report, run_daily
 
 # 테스트 전용 고정 기준 (사용자 설정과 무관): 보증금 3000·월세 50만원, 근소초과 +3000/+10
 TEST_CFG = {
     'max_deposit_manwon': 3000, 'max_rent_manwon': 50, 'near_tolerance_deposit_manwon': 3000, 'near_tolerance_rent_manwon': 10,
     'exclude_gu': [], 'due_soon_days': 3, 'soco_assumed_window_days': 3, 'http_timeout_sec': 5, 'http_retries': 0,
-    'pages': {'sh': 1, 'seoulportal': 1, 'soco': 1, 'lh_lookback_days': 60, 'socialhousing': 1},
+    'pages': {'sh': 1, 'seoulportal': 1, 'soco': 1, 'lh_lookback_days': 60, 'socialhousing': 1, 'lh_rolling_days': 0},
     'socialhousing_max_age_days': 60,
     'docs': {'enabled': False, 'ocr': False, 'max_items_per_run': 20, 'max_files_per_item': 4, 'ocr_max_pages': 12}}
 ROOT = Path(tempfile.mkdtemp(prefix='housing-selftest-'))
@@ -162,6 +165,115 @@ md = report.render_alert(cd='2026-10-05', cfg=cfg, res=dict(counts={'sh': 1}, el
                             fit_reason='2000/37만원', url='u')])])
 ok('부합' in md and f"{cfg['max_deposit_manwon']:g}만원" in md and '알릴 것 없음' not in md, 'report 알림 헤더·섹션')
 ok(docs._rhwp() is not None, 'rhwp-python 로드(HWP 파서; 실패 시 hwp5html 폴백만 사용)')
+
+# 12 설정 하위호환: 새 키가 없으면 월세+청년, 태그·지원프로그램 기존과 동일
+ok(cfg['lease_types'] == ['monthly'] and cfg['targets'] == ['youth'] and cfg['support_programs'] is False
+   and hdb.monthly_tag(cfg) == '@3000/50' and cfg['monthly']['max_deposit_manwon'] == 3000, '구 설정 → 월세+청년·태그 @3000/50·지원프로그램 끔')
+cb = hdb.normalize_cfg(dict(TEST_CFG, lease_types=['monthly', 'jeonse'], targets=['youth', 'newlywed']))
+ok(cb['support_programs'] is True and cb['jeonse']['max_deposit_manwon'] == 20000 and hdb.monthly_tag(cb) == '@3000/50/newlywed,youth'
+   and hdb.jeonse_tag(cb) == '@20000/newlywed,youth', '새 설정 → 전세 기본값·지원프로그램 켬·대상 포함 태그')
+co = hdb.normalize_cfg(dict(TEST_CFG), {'max_deposit_manwon': 2500, 'jeonse_max_deposit_manwon': 15000})
+ok(co['max_deposit_manwon'] == co['monthly']['max_deposit_manwon'] == 2500 and co['jeonse']['max_deposit_manwon'] == 15000, 'CLI 덮어쓰기: 월세(최상위)·전세 상한')
+# 13 관련성: 구 규칙(main 의 EXCLUDE)과 새 규칙(설정 없음)이 대표 제목에서 동일
+OLD_EX = re.compile(r'접수결과|접수마감|청약마감|당첨자|예비\d*차|발표|경쟁률|계약안내|계약결과|입주안내|안내문|재계약|서비스|일시중단|일정 연기|신혼|신생아|다자녀|고령자|장기전세|전세주택|든든전세|전세형|희망하우징|기숙사|연극인|예술인|육아|공공한옥|두레주택|가정어린이집')
+def old_rel(it):
+    if it['source'] == 'soco': return not re.search(r'신혼부부', it['title'])
+    if it['source'] == 'socialhousing': return it.get('status') == '모집중' and '서울' in (it.get('address') or '') and not OLD_EX.search(it['title'])
+    if it['source'] == 'lh' and it.get('category') in ('행복주택',) and not OLD_EX.search(it['title']): return True
+    return bool(collect.RELEVANT.search(it['title'])) and not OLD_EX.search(it['title'])
+TITLES = [('sh', '2026년 하반기 신혼·신생아 매입임대주택Ⅰ 입주자 모집공고', None), ('sh', '제51차 장기전세주택 입주자 모집공고', None),
+          ('sh', '2026년 2차 청년 매입임대주택 입주자 모집공고', None), ('sh', '청년 매입임대 당첨자 발표', None),
+          ('seoulportal', '2026년 전세임대형 든든주택 입주자 모집공고', None), ('lh', '서울대방 신혼희망타운 행복주택', '행복주택'),
+          ('lh', '[서울지역본부] 26년 2차 비분양전환형 든든전세주택 입주자 모집공고', '공공임대'), ('lh', '서울 행복주택 예비입주자', '행복주택'),
+          ('sh', '2026년 일반주택형 미리내집(공공한옥) 잔여세대 입주자 모집공고', None), ('sh', '고령자복지주택 입주자 모집', None),
+          ('soco', '[민간임대] 테스트 청년안심주택 신혼부부 추가모집', None), ('soco', '[민간임대] 테스트 청년안심주택 추가모집', None),
+          ('sh', '청년·신혼부부 매입임대주택 입주자 모집', None), ('sh', '재개발임대주택 입주자 모집', None), ('sh', '제8차 장기전세주택2(미리내집) 청약접수 결과 안내', None)]
+items = [dict(source=a, item_id=str(i), title=t, category=c) for i, (a, t, c) in enumerate(TITLES)] + \
+        [dict(source='socialhousing', item_id='s', title='테스트 사회주택 모집', status='모집중', address='서울 마포구')]
+ok(all(old_rel(it) == collect.is_relevant(it, cfg) for it in items), '관련성: 구 설정에서 구 EXCLUDE 규칙과 동일')
+CB = dict(lease_types=['monthly', 'jeonse'], targets=['youth', 'newlywed'], support_programs=True)
+def rel(prefix): return next(collect.is_relevant(it, CB) for it in items if it['title'].startswith(prefix))
+ok(rel('2026년 하반기 신혼') and rel('제51차 장기전세주택') and rel('2026년 전세임대형') and rel('서울대방 신혼희망타운') and rel('2026년 일반주택형')
+   and not rel('고령자복지주택') and not rel('제8차 장기전세주택2') and not rel('청년 매입임대 당첨자'), '관련성: 월세+전세·청년+신혼 설정(결과공지·고령자 제외)')
+ok(not collect.is_relevant(items[2], dict(targets=['newlywed'])) and collect.is_relevant(items[0], dict(targets=['newlywed'])),
+   '관련성: 신혼부부만 → 청년 전용 공고 제외·신혼 공고 포함')
+ok([collect.lease_of(dict(title=t)) for t in ('제51차 장기전세주택', '전세임대형 든든주택', '신혼·신생아매입임대주택Ⅱ(전세형)', '행복주택', '전세대 전액 보증 안내')]
+   == ['jeonse', 'support', 'jeonse', 'monthly', 'monthly'], '임대유형 분류(제목 기준, 전세대 오탐 없음)')
+# 14 전세 표 파서·공급대상 열
+TJ = [['주택형', '전용면적', '임대보증금'], ['59A', '59.97', '184,100,000']]
+ok(docs.parse_table(TJ) == [], '보증금만 있는 표: 전세 힌트 없으면 무시(월세 오판 방지)')
+uj = docs.parse_table(TJ, jeonse=True)
+ok(len(uj) == 1 and uj[0]['deposit'] == 18410 and uj[0]['rent'] == 0 and uj[0]['lease_type'] == 'jeonse', '전세 공고 표 → rent=0·lease_type=jeonse')
+ok(len(docs.parse_table([['주택형', '전용면적', '전세보증금(원)'], ['59A', '59.97', '184,100,000']])) == 1, '헤더 "전세보증금" → 전세 행')
+ok(docs.parse_table([['주택형', '전용면적', '전세대 보증금(원)'], ['59A', '59.97', '184,100,000']]) == [], '"전세대" 는 전세로 보지 않음')
+ut = docs.parse_table([['공급대상', '전용면적', '임대보증금', '월임대료'], ['청년', '20.5', '1,000', '30'], ['신혼부부', '40.1', '3,000', '50'],
+                       ['고령자', '20.5', '500', '10'], ['청년·신혼부부', '30.5', '2,000', '40']])
+ok([u['target'] for u in ut] == ['청년', '신혼부부', '기타', '공통'], f"공급대상 열 → 청년/신혼부부/기타/공통 {[u['target'] for u in ut]}")
+# 15 전세 판정
+J = lambda l, d, t='공통', r=0, o='human': dict(unit_label=l, area_m2=59, deposit=d, rent=r, target=t, origin=o, lease_type='jeonse' if not r else 'monthly')
+ok(hdb.judge_jeonse([J('a', 20000)], {}, False, cb)[0] == 'match', '전세 경계값(=2억) match')
+ok(hdb.judge_jeonse([J('a', 20000.1)], {}, False, cb)[0] == 'near' and hdb.judge_jeonse([J('a', 25000.1)], {}, False, cb)[0] == 'no', '전세 근소(+5000) / 범위 밖')
+f, r_, b, _ = hdb.judge_jeonse([J('w', 18000, r=5)], {}, False, cb)
+ok(f == 'match' and b['conv'] and '전환' in r_, '🔁 월 5만·보증금 1.8억 월세 옵션 → 전세 판정 match(전환)')
+ok(hdb.judge_jeonse([J('w', 562, r=6.63)], {}, False, cb) is None, '보증금 5000만 미만 저월세는 전세 아님(재개발임대 등)')
+ok(hdb.judge_jeonse([], {}, False, cb, notice_jeonse=True)[0] == 'unknown' and hdb.judge_jeonse([], {}, False, cb) is None, '전세 공고·표 없음 → unknown / 월세 공고 → 해당 없음')
+ok(hdb.judge_jeonse([J('n', 15000, '신혼부부')], {}, False, cfg)[0] == 'no' and hdb.judge_jeonse([J('n', 15000, '신혼부부')], {}, False, cb)[0] == 'match',
+   '대상 필터: 청년만이면 신혼부부 전세 no, 둘 다면 match')
+ok(hdb.judge([J('j', 15000), U('m', 20, 2000, 40)], {}, False, cfg)[2]['unit_label'] == 'm', '월세 판정은 전세 행(rent=0) 무시')
+ok(hdb.judge([U('e', 20, 500, 10, '기타')], {}, False, cfg)[0] == 'no', '고령자 등 기타 대상 행은 판정 제외')
+# 16 혼합 공고 → 월세·전세 블록 각각 + 지원 프로그램 + HUG(공고 단위)
+fake2 = {'sh': lambda c: [dict(source='sh', item_id='3001', title='2026년 청년 매입임대주택 입주자 모집공고', posted='2026-10-01', apply_start='2026-10-05', apply_end='2026-10-08', url='u3')],
+         'lh_support': lambda c: [dict(source='lh', item_id='S1', title='신혼·신생아 전세임대 Ⅰ 수시', category='전세임대', posted='2026-03-24', apply_end='2026-12-31', status='접수중', lease='support', url='us')],
+         'hug': lambda c: [dict(source='hug', item_id='260929', title='HUG 든든전세주택 12차 입주자 모집 공고', category='든든전세주택', lease='jeonse', posted='2026-09-30',
+                                apply_start='2026-09-30', apply_end='2026-10-12', extra_note='서울 420호', elig='공고일 기준 무주택세대구성원', url='uh')]}
+sources.ALL = fake2
+con = fresh_db('t16'); units.put_unit(con, 'sh', '3001', 'A 기본', 20, 2000, 40, '청년'); units.put_unit(con, 'sh', '3001', 'B 전환', 40, 18000, 5, '신혼부부'); con.commit()
+r16 = collect.run(date='2026-10-06'); ok(set(r16['counts']) == {'sh'}, f"구 설정: 전세·지원 소스는 수집 안 함 {r16['counts']}")
+L = {x['item_id']: dict(x) for x in con.execute("SELECT * FROM listings WHERE collected_date='2026-10-06'")}
+ok(L['3001']['fit'] == L['3001']['fit_monthly'] == 'match' and L['3001']['fit_jeonse'] is None, '구 설정: 판정 = 월세 판정, 전세 판정 없음')
+con = fresh_db('t16b'); units.put_unit(con, 'sh', '3001', 'A 기본', 20, 2000, 40, '청년'); units.put_unit(con, 'sh', '3001', 'B 전환', 40, 18000, 5, '신혼부부'); con.commit()
+ovr = {'lease_types': ['monthly', 'jeonse'], 'targets': ['youth', 'newlywed']}
+r16 = collect.run(ovr, date='2026-10-06'); cb2 = r16['cfg']
+L = {x['item_id']: dict(x) for x in con.execute("SELECT l.*, i.notified_fit, i.notified_jeonse, i.notified_support FROM listings l JOIN items i USING(source,item_id) WHERE collected_date='2026-10-06'")}
+ok(L['3001']['fit_monthly'] == 'match' and L['3001']['fit_jeonse'] == 'match' and json.loads(L['3001']['best_json'])['jeonse']['conv'], '혼합 공고: 월세 match + 전세(🔁) match')
+ok(L['260929']['lease_type'] == 'jeonse' and L['260929']['fit_jeonse'] == 'unknown' and L['260929']['elig_note'] == '공고일 기준 무주택세대구성원', 'HUG: 전세 공고 단위·자격 문구')
+ok(L['S1']['fit'] == 'program' and L['S1']['lease_type'] == 'support', '전세임대 → program(가격 판정 없음)')
+rows16 = list(L.values())
+bm, _ = run_daily.block(con, rows16, 'fit_monthly', 'notified_fit', hdb.monthly_tag(cb2), 'reason_monthly')
+bj, _ = run_daily.block(con, rows16, 'fit_jeonse', 'notified_jeonse', hdb.jeonse_tag(cb2), 'reason_jeonse')
+sup = [x for x in rows16 if x['fit'] == 'program']
+md = report.render_chat(cd='2026-10-06', cfg=cb2, blocks={'monthly': bm, 'jeonse': bj}, support=sup, fails={})
+lines = md.split('\n')
+ok(lines[0] == '**서울 청년·신혼부부 월세·전세 수집** · 2026-10-06' and lines[1] == '월세 부합 1 / 전세 부합 1 · 공고 1 / 지원 프로그램 1', f'채팅: 제목·한 줄 요약 {lines[:2]}')
+ok(md.index('**월세**') < md.index('• 기준: 보증금 ≤3,000만 · 월세 ≤50만') < md.index('**전세**') < md.index('• 기준: 전세 보증금 ≤2억') < md.index('📋 **지원 프로그램**'),
+   '채팅: 월세 블록 → 전세 블록 → 지원 프로그램 순서·블록별 기준줄')
+ok('🔁 전환 · 보증금 1억 8,000만 / 월세 5만' in md and md.count('✅ **조건 부합** (1)') == 2 and '서울 420호' in md.split('⚠️ **공고 단위 확인** (1)')[1]
+   and '· 신혼부부' not in md.split('**전세**')[0] and '· 신혼부부' in md.split('**전세**')[1], '채팅: 🔁 전환은 전세 블록·블록별 ✅·대상 태그=주택형 대상·HUG 공고 단위')
+cy = hdb.normalize_cfg(dict(TEST_CFG))
+md1 = report.render_chat(cd='2026-10-06', cfg=cy, blocks={'monthly': bm}, support=[], fails={})
+ok(md1.split('\n')[0] == '**서울 청년 월세 수집** · 2026-10-06' and '**월세**' not in md1 and '· 청년' not in md1 and md1.split('\n')[1] == '월세 부합 1',
+   '채팅: 대상 1개·유형 1개 → 블록 제목·대상 태그 없음(승인 템플릿)')
+ok(report.render_chat(cd='d', cfg=cy, blocks={'monthly': {}}) == '**알릴 것 없음**', '채팅: 알릴 것 없음')
+ok(report.man(18410) == '1억 8,410만' and report.man(2000) == '2,000만' and report.man(20000) == '2억' and report.man(87.5) == '87.5만', '금액 표기(억·만)')
+sources.ALL = orig
+# 17 스키마 마이그레이션 멱등 (재연결 시 컬럼 중복 추가 없음)
+c2 = hdb.connect(); c3 = hdb.connect()
+cols = [x[1] for x in c3.execute('PRAGMA table_info(listings)')]
+ok(all(cols.count(k) == 1 for k in ('lease_type', 'fit_jeonse', 'best_json', 'elig_note')) and 'notified_jeonse' in [x[1] for x in c3.execute('PRAGMA table_info(items)')], '마이그레이션 멱등·새 컬럼')
+# 18 HUG 공고 텍스트 파싱 (마감 표기 상이 → 늦은 날짜 + 경고)
+hug_txt = ('HUG 든든전세주택 12차 입주자 모집 공고 [2026.9.30]\n모집공고일은 2026.9.30.(수)이며\n총 900호(서울 420호, 인천 360호)\n'
+           '전세보증금은 시중 전세시세의 90% 이하\n(입주자격) 공고일 기준 무주택세대구성원\n신청접수\n9.30(수)\n10:00\n~\n10.12(월)\n17:00\n'
+           '구분 신청접수 기간 9.30(수) 10:00 ~ 10.8(목) 17:00\n')
+h = sources.parse_hug(hug_txt)
+ok(h['posted'] == '2026-09-30' and h['apply_start'] == '2026-09-30' and h['apply_end'] == '2026-10-12' and '서울 420호' in h['extra_note']
+   and '90%' in h['extra_note'] and '상이' in h['extra_note'] and h['elig'] == '공고일 기준 무주택세대구성원', f'HUG 공고 파싱 {h}')
+# 19 서울주거포털: 셀 안 HTML 주석 제거 + SH 링크 사용
+html_sp = ('<table><tr><td>38</td><td>매입임대</td><td>테스트 공고</td><td class="td4"> <!-- 2021-01-25 클래스 수정 -->2026-09-30</td>'
+           '<td>2026-11-20</td><td>모집중</td><td>담당</td><td><a href="https://www.i-sh.co.kr/main/lay2/program/S1T294C295/www/brd/m_241/view.do?seq=310650">링크</a></td></tr></table>')
+sources.curl = lambda *a, **k: html_sp
+try: sp = sources.seoulportal(cfg)
+finally: sources.curl = orig_curl
+ok(sp and sp[0]['posted'] == '2026-09-30' and sp[0]['url'].endswith('seq=310650'), f"서울주거포털 게시일·링크 {sp and (sp[0]['posted'], sp[0]['url'][-12:])}")
 
 shutil.rmtree(ROOT)
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAIL'}")
