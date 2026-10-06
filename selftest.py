@@ -306,6 +306,45 @@ try: sp = sources.seoulportal(cfg)
 finally: sources.curl = orig_curl
 ok(sp and sp[0]['posted'] == '2026-09-30' and sp[0]['url'].endswith('seq=310650'), f"서울주거포털 게시일·링크 {sp and (sp[0]['posted'], sp[0]['url'][-12:])}")
 
+# 20 LH 지역: '서울특별시 외' = 서울+타 지역 → 상세 공급 목록으로 서울 포함 확인, 서울 공급 없는 공고 제외
+def lh_page(rows): return "<script>var list = JSON.parse('" + json.dumps(rows, ensure_ascii=False) + "');</script>"
+R = lambda cnp, sbd, n: dict(cnpNm=cnp, sbdLgoNm=sbd, totRsdcSplQom=n)
+pg_seoul = lh_page([R('서울지역본부 전세임대', '전세(서울강남구)', 25), R('서울지역본부 전세임대', '전세(서울마포구)', 25), R('부산울산지역본부 전세임대', '전세(부산중구)', 10)])
+pg_other = lh_page([R('인천지역본부 전세임대', '전세(인천중구)', 30), R('인천지역본부 전세임대', '전세(경기부천시)', 20)])
+sp = sources.parse_lh_supply(pg_seoul, ['강남구'])
+ok(sp['seoul'] == 50 and sp['seoul_ok'] == 25 and sp['seoul_ok_gu'] == ['마포구'] and sp['total'] == 60, f'LH 상세 공급 목록 → 서울 호수(제외 구 반영) {sp}')
+ok(sources.parse_lh_supply('<html>no list</html>') is None, 'LH 상세: 공급 목록 없으면 None')
+K = sources.lh_region_keep
+ok(K('서울특별시 외', 't', sp) == (True, '서울 25호 · 1개 구') and K('인천광역시 외', 't', sources.parse_lh_supply(pg_other))[0] is False
+   and K('서울특별시 외', 't', None)[0] is True and K('인천광역시 외', 't', None)[0] is False and K('경기도', 't', None)[0] is False
+   and K('전국', 't', None)[0] is True and K('서울특별시 외', 't', sources.parse_lh_supply(pg_seoul, ['강남구', '마포구']))[0] is False,
+   "LH 지역 판정: '서울특별시 외' 유지, 타 지역('인천광역시 외'·단일) 제외, 상세 목록 우선, 서울 공급이 전부 제외 구면 제외")
+def lh_row(pan, title, region, status='접수중'):
+    return (f'<tr><td>1</td><td>전세임대</td><td><a data-id1="{pan}" data-id2="03" data-id3="13" data-id4="17">{title}</a></td><td>{region}</td>'
+            f'<td></td><td>2026.03.24</td><td>2026.12.31</td><td>{status}</td></tr>')
+lst = '<table><tr><th>공고명</th></tr>' + lh_row('P1', '청년 전세임대 수시', '서울특별시 외') + lh_row('P2', '인천 신혼 전세임대', '인천광역시 외') + lh_row('P3', '경기 전세임대', '경기도') + '</table>'
+def fake_lh(url, data=None, **k):
+    if 'selectWrtancList' in url: return lst
+    return pg_seoul if 'panId=P1' in data else pg_other
+sources.curl = fake_lh
+try: sup = sources.lh_support(dict(cfg, exclude_gu=['강남구']))
+finally: sources.curl = orig_curl
+ok([x['item_id'] for x in sup] == ['P1'] and sup[0]['extra_note'] == '서울 25호 · 1개 구' and sup[0]['lease'] == 'support', f'LH 전세임대: 서울 공급 있는 공고만·호수 비고 {[(x["item_id"], x.get("extra_note")) for x in sup]}')
+# 21 주택형 단위 제외 구
+ok(hdb.unit_gu(dict(unit_label='강동구 서도휴빌(2차) 102동 42C')) == '강동구' and hdb.unit_gu(dict(unit_label='전세(서울강남구)')) == '강남구'
+   and hdb.unit_gu(dict(unit_label='동소문한진')) is None and hdb.unit_gu(dict(unit_label='강남구청역 앞')) is None, '주택형 라벨 → 자치구')
+cx = dict(cfg, exclude_gu=['강남구'])
+G = lambda l, d, r: dict(unit_label=l, area_m2=30, deposit=d, rent=r, target='공통')
+f, r_, b, _ = hdb.judge([G('강남구 A빌 101호', 1000, 20), G('마포구 B빌 201호', 2500, 45), G('C빌', 2900, 49)], {}, False, cx)
+ok(f == 'match' and b['unit_label'].startswith('마포구'), f'제외 구 주택형은 판정·대표 선택에서 빠짐 ({f}, {b and b["unit_label"]})')
+f, r_, *_ = hdb.judge([G('강남구 A빌', 1000, 20), G('강남구 D빌', 1200, 25)], {}, False, cx)
+ok(f == 'excluded_region' and '강남구' in r_, f'모든 주택형이 제외 구 → excluded_region ({f}: {r_})')
+ok(hdb.judge([G('강남구 A빌', 1000, 20)], {}, False, cfg)[0] == 'match', '제외 구 설정 없으면 영향 없음')
+cxj = dict(cb, exclude_gu=['강남구'])
+ok(hdb.judge_jeonse([dict(G('강남구 E', 15000, 0), lease_type='jeonse')], {}, False, cxj)[0] == 'excluded_region'
+   and hdb.judge_jeonse([dict(G('강남구 E', 15000, 0), lease_type='jeonse'), dict(G('마포구 F', 19000, 0), lease_type='jeonse')], {}, False, cxj)[2]['unit_label'] == '마포구 F',
+   '전세 판정도 주택형 단위 제외 구 적용')
+
 shutil.rmtree(ROOT)
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAIL'}")
 sys.exit(1 if FAILS else 0)

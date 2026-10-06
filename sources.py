@@ -67,20 +67,66 @@ def _lh_rows(s):
                         posted=norm_date(c[5]), apply_end=norm_date(c[6]), status=c[7],
                         url=f'https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancView.do?panId={pan}&ccrCnntSysDsCd={ccr}&uppAisTpCd={upp}&aisTpCd={ais}&mi=1026')
     return out, td_rows
+LH_INFO = 'https://apply.lh.or.kr/lhapply/apply/wt/wrtanc/selectWrtancInfo.do'
+def parse_lh_supply(page, exclude_gu=()):
+    """LH 공고 상세(selectWrtancInfo.do) 안의 공급 목록 JSON(`JSON.parse('[...]')`, 행 = 지역본부·지자체별 공급호수) → 서울 공급 요약.
+    returns None(목록 없음·파싱 실패) 또는 dict(rows, total, seoul, seoul_gu=[...], seoul_ok, seoul_ok_gu=[...]) — *_ok 는 제외 구를 뺀 값."""
+    rows = []
+    for blob in re.findall(r"JSON\.parse\('(\[.*?\])'\)", page or '', re.S):
+        try: d = json.loads(blob)
+        except Exception: continue
+        rows += [x for x in d if isinstance(x, dict) and ('sbdLgoNm' in x or 'cnpNm' in x)]
+    if not rows: return None
+    def n(x): return x.get('totRsdcSplQom') or 0
+    def gu(x):
+        m = re.search(r'서울(?:특별시)?\s*([가-힣]+구)', x.get('sbdLgoNm') or '')
+        return m.group(1) if m else None
+    seoul = [x for x in rows if '서울' in (x.get('sbdLgoNm') or '') + (x.get('cnpNm') or '')]
+    ok = [x for x in seoul if gu(x) not in set(exclude_gu or ())]
+    return dict(rows=len(rows), total=sum(n(x) for x in rows), seoul=sum(n(x) for x in seoul), seoul_gu=sorted({gu(x) for x in seoul} - {None}),
+                seoul_ok=sum(n(x) for x in ok), seoul_ok_gu=sorted({gu(x) for x in ok} - {None}))
+def lh_supply(it, cfg):
+    """공고 상세를 받아 서울 공급 요약(실패 시 None)."""
+    m = re.search(r'panId=([^&]+)&ccrCnntSysDsCd=([^&]*)&uppAisTpCd=([^&]*)&aisTpCd=([^&]*)', it.get('url') or '')
+    if not m: return None
+    try:
+        page = curl(LH_INFO, 'panId=%s&ccrCnntSysDsCd=%s&uppAisTpCd=%s&aisTpCd=%s&mi=1026' % m.groups(), timeout=cfg['http_timeout_sec'], retries=cfg['http_retries'])
+    except Exception: return None
+    return parse_lh_supply(page, cfg.get('exclude_gu') or ())
+def lh_region_keep(region, title, supply):
+    """서울 공급 여부 판단 → (keep, note).
+    LH 목록 '지역' 열은 첫 지역 + '외'(= 그 지역 외 다른 지역도 포함). 예: '서울특별시 외' = 서울+타 지역(청년 전세임대: 서울 25개 구 포함 230개 지자체),
+    '인천광역시 외' = 인천+부천. 그래서 '외'만 보고 버리지 않는다. 상세 공급 목록이 있으면 그것이 최종(서울 행 합계 > 0, 제외 구 뺀 값)."""
+    r = region or ''
+    if supply:
+        if supply['seoul'] <= 0: return False, '서울 공급 없음'
+        if supply['seoul_ok'] <= 0: return False, '서울 공급이 모두 제외 구'
+        k = len(supply['seoul_ok_gu'])
+        return True, f"서울 {supply['seoul_ok']:,}호" + (f' · {k}개 구' if k else '')
+    if '서울' in r or '서울' in (title or ''): return True, None
+    if r == '' : return True, None            # 지역 정보 없음(서울 필터 조회 결과) → 유지
+    if r == '전국': return True, '전국 공고(서울 공급 원문 확인)'
+    return False, f'지역 {r} — 서울 공급 미확인'
+
 def lh(cfg):
     data = _lh_query(cfg['pages']['lh_lookback_days'])
     s = curl(LH_LIST, data, timeout=cfg['http_timeout_sec'], retries=cfg['http_retries'])
     if '공고명' not in s: raise RuntimeError('LH 응답에 목록 헤더 없음(구조 변경 의심)')
     out, td_rows = _lh_rows(s)
-    for it in out.values(): it.pop('region', None)
     if td_rows and not out: raise RuntimeError(f'LH 목록 행 {td_rows}개인데 파싱 0건 — 구조 변경 의심(data-id 속성)')
     roll = cfg['pages'].get('lh_rolling_days') or 0
     if roll > cfg['pages']['lh_lookback_days']:   # 연중 수시모집(게시일이 오래됐지만 지금 접수중) 보강
         try:
             r2, _ = _lh_rows(curl(LH_LIST, _lh_query(roll), timeout=cfg['http_timeout_sec'], retries=cfg['http_retries']))
             for pan, it in r2.items():
-                if pan not in out and it['status'] in LH_OPEN: it.pop('region', None); it['rolling'] = True; out[pan] = it
+                if pan not in out and it['status'] in LH_OPEN: it['rolling'] = True; out[pan] = it
         except Exception: pass
+    for pan in list(out):                         # 서울 필터 결과라도 지역 열이 '서울특별시'가 아니면 상세 공급 목록으로 서울 포함 확인
+        it = out[pan]; reg = it.pop('region', '') or ''
+        if reg in ('', '서울특별시'): continue
+        keep, note = lh_region_keep(reg, it['title'], lh_supply(it, cfg))
+        if not keep: del out[pan]
+        elif note: it['extra_note'] = note
     if not out:   # 서울 0건: 전국 카나리 조회로 '진짜 0건'과 '구조 변경/차단' 구분
         c2 = curl(LH_LIST, data.replace('cnpCd=11', 'cnpCd='), timeout=cfg['http_timeout_sec'], retries=cfg['http_retries'])
         n2 = len(re.findall(r'data-id1="', c2))
@@ -161,8 +207,12 @@ def lh_support(cfg):
     out, _ = _lh_rows(s)
     res = []
     for it in out.values():
-        if it['category'] != '전세임대' or it['status'] not in LH_OPEN or not re.search(r'서울|전국', it['region'] or ''): continue
-        it['lease'] = 'support'; it['extra_note'] = f"지역 {it.pop('region')}"; res.append(it)
+        if it['category'] != '전세임대' or it['status'] not in LH_OPEN: continue
+        reg = it.pop('region', '') or ''
+        if reg and not re.search(r'서울|전국|외$', reg): continue           # 단일 타 지역 → 상세 조회 생략
+        keep, note = lh_region_keep(reg, it['title'], lh_supply(it, cfg))   # 상세 공급 목록(지자체별 호수)으로 서울 포함 확인
+        if not keep: continue
+        it['lease'] = 'support'; it['extra_note'] = note; res.append(it)
     return res
 
 HUG_LIST = 'https://www.khug.or.kr/jeonse/web/s07/s070102.jsp'

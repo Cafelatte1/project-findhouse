@@ -1,5 +1,5 @@
 """공용: DB 스키마/연결/판정 로직."""
-import sqlite3, json, os, datetime as dt
+import sqlite3, json, os, re, datetime as dt
 from pathlib import Path
 # 데이터·설정 위치: 환경변수 HOUSING_DIR (기본 = 이 스크립트가 있는 폴더)
 BASE = Path(os.environ.get('HOUSING_DIR') or Path(__file__).resolve().parent); DB = BASE/'housing.db'; CFG = BASE/'config.json'
@@ -135,6 +135,24 @@ def pick_units(units):
         us = [u for u in units if (u.get('origin') or 'human') == basis]
         if us: return basis, us
     return 'none', []
+SEOUL_GU = ('종로구 중구 용산구 성동구 광진구 동대문구 중랑구 성북구 강북구 도봉구 노원구 은평구 서대문구 마포구 양천구 강서구 '
+            '구로구 금천구 영등포구 동작구 관악구 서초구 강남구 송파구 강동구').split()
+_GU_RE = re.compile(r'(?:^|[^가-힣]|서울(?:특별시)?\s?)(' + '|'.join(sorted(SEOUL_GU, key=len, reverse=True)) + r')(?![가-힣])')
+def unit_gu(u):
+    """주택형 행의 자치구: units.gu(있으면) > 라벨/비고 속 '마포구'·'서울마포구' 표기. 없으면 None."""
+    if u.get('gu'): return u['gu']
+    m = _GU_RE.search(f"{u.get('unit_label') or ''} {u.get('note') or ''}")
+    return m.group(1) if m else None
+def drop_excluded_gu(units, cfg):
+    """제외 구(exclude_gu)에 있는 주택형 행을 뺀다 → (남은 행, 뺀 구 목록). 구를 모르는 행은 유지."""
+    ex = set(cfg.get('exclude_gu') or ())
+    if not ex: return list(units), []
+    keep, gone = [], set()
+    for u in units:
+        g = unit_gu(u)
+        if g in ex: gone.add(g)
+        else: keep.append(u)
+    return keep, sorted(gone)
 def is_jeonse_unit(u): return (u.get('lease_type') == 'jeonse') or not u.get('rent')
 def judge(units, meta, closed, cfg):
     """월세 판정. returns fit, reason, best_unit, basis.  (전세 표 행(rent=0)은 제외)
@@ -149,6 +167,8 @@ def judge(units, meta, closed, cfg):
 def _judge(units, meta, closed, cfg):
     gu = (meta or {}).get('gu') or ''
     if any(g in gu for g in cfg['exclude_gu']): return 'excluded_region', f'제외 지역 {gu}', None
+    units, gone = drop_excluded_gu(units, cfg)            # 주택형 단위 제외 구(라벨에 구가 있는 행)
+    if gone and not units: return 'excluded_region', f"제외 지역 {'·'.join(gone)}(모든 주택형)", None
     ok_t = target_set(cfg); us = [u for u in units if (u['target'] or '공통') in ok_t]
     md, mr = cfg['max_deposit_manwon'], cfg['max_rent_manwon']
     nd, nr = md + cfg['near_tolerance_deposit_manwon'], mr + cfg['near_tolerance_rent_manwon']
@@ -178,6 +198,8 @@ def judge_jeonse(units, meta, closed, cfg, notice_jeonse=False):
     basis, us = pick_units(cand)
     gu = (meta or {}).get('gu') or ''
     if any(g in gu for g in cfg['exclude_gu']): return 'excluded_region', f'제외 지역 {gu}', None, basis
+    us, gone = drop_excluded_gu(us, cfg)
+    if gone and not us: return 'excluded_region', f"제외 지역 {'·'.join(gone)}(모든 주택형)", None, basis
     ok_t = target_set(cfg); us2 = [u for u in us if (u['target'] or '공통') in ok_t]
     if us and not us2: return ('closed' if closed else 'no'), f"{'·'.join(sorted(ok_t - {'공통'}))} 대상 전세 주택형 없음", None, basis
     if not us2: return ('closed' if closed else 'unknown'), '전세 주택형·보증금 미확인(공고문 확인 필요)', None, basis

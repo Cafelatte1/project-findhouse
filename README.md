@@ -19,7 +19,7 @@ logs in, or contacts anyone.
 | 서울주거포털 (housing.seoul.go.kr) | HTML (curl) |
 | 사회주택협회 listings (socialhousing.kr) | HTML (curl) |
 | HUG 든든전세주택 (khug.or.kr, jeonse only) | latest notice PDF (cp949 list page) → Seoul unit count, deposit rule, window, eligibility — notice-level, no per-house prices |
-| LH 전세임대 programs (nationwide rolling, support programs only) | POST form, region = 서울 / 전국 and open only |
+| LH 전세임대 programs (nationwide rolling, support programs only) | POST form + notice detail; open only, and only when the detail's per-municipality supply list has Seoul rows (note `서울 N호 · K개 구`) |
 
 Attachments of new / unpriced notices: text PDFs → `pdfplumber` tables, HWP/HWPX → `rhwp-python` tables
 (fallback `hwp5html`). **Image-only notices are not OCR'd by default**: the pipeline renders page PNGs and flags the
@@ -61,7 +61,7 @@ Notes
 | `jeonse.jeonse_like_max_rent_manwon`, `jeonse.jeonse_like_min_deposit_manwon` | a monthly option with rent ≤ 10만 **and** deposit ≥ 5000만 (defaults) is "jeonse-like" (🔁) and is also judged in the jeonse block |
 | `support_programs` | list 전세임대 programs (tenant finds the house) in a short 📋 section — default on when jeonse is selected |
 | `conversion_rate_pct` | optional, display only (never used for judging) |
-| `exclude_gu` | districts to exclude (empty = none) |
+| `exclude_gu` | districts to exclude (empty = none). Applied per notice and per unit: unit rows whose label/table names an excluded 구 are dropped from judging; a notice whose units are all in excluded districts is dropped |
 | `due_soon_days` | closing-soon alert window |
 | `docs.*` | attachment extraction limits, `ocr` on/off |
 
@@ -132,6 +132,7 @@ Full design, schema, alert template and limitations: [`DESIGN.md`](DESIGN.md).
 - Prices are only taken from the notice (human-checked or parsed tables); nothing is guessed. Unparsed notices show as "price unknown".
 - Eligibility (income / assets / subscription account / no-home household / marriage period) is not auto-judged; a short note is shown and the notice must be checked.
 - Jeonse support programs (전세임대) and HUG 든든전세 are notice-level only: no per-house price judgment.
+- LH region labels like `서울특별시 외` mean "Seoul and other regions" (not "outside Seoul"); Seoul supply is confirmed from the notice detail's supply list, and notices without Seoul supply are dropped.
 - Site structure changes break parsers; source failures are isolated and reported, LH has an explicit structure-change canary.
 - 마이홈포털 is not collected (blocked from many networks); the data.go.kr API is a possible future source.
 
