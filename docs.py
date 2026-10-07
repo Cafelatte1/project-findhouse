@@ -7,7 +7,7 @@
 사용: python docs.py process <source> <item_id> [--force] [--ocr]   |  python docs.py list [source item_id]"""
 import re, json, hashlib, subprocess, datetime as dt, html as H, zipfile, sys, tempfile, shutil
 from pathlib import Path
-import hdb
+import hdb, addr
 
 DOCS = hdb.BASE / 'docs'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
@@ -17,7 +17,7 @@ MONEY_COLS_BAD = re.compile(r'계약금|잔금|중도금|관리비')
 JEONSE_HDR = re.compile(r'전세(?!대)')          # 표 헤더/제목의 전세 신호 ('전세대'=전 세대 제외). 본문 키워드는 쓰지 않음
 TARGET_COL = re.compile(r'공급\s*대상|입주\s*대상|모집\s*대상|공급\s*유형|계층')
 OTHER_TARGET = re.compile(r'고령|주거급여|수급자')
-PARSER_VERSION = '2.1'   # 2.1: 전세(보증금 단독) 표·공급대상 열·고령자 행 분리   # 파서/구조화 스키마 버전 — 바뀌면 sha256 캐시 무효화
+PARSER_VERSION = '2.2'   # 2.2: 주소(단지별 주소표·주택위치) / 2.1: 전세(보증금 단독) 표·공급대상 열·고령자 행 분리   # 파서/구조화 스키마 버전 — 바뀌면 sha256 캐시 무효화
 # FreeType: rhwp-python 번들 libfreetype 이 FT_Palette_Data_Get 심볼이 비어 시스템 lib 를 먼저 로드
 def _preload_freetype():
     import ctypes
@@ -46,19 +46,20 @@ def _curl(url, out=None, referer=None, timeout=60):
     return None if out else r.stdout.decode('utf-8', 'ignore')
 
 # ---------------------------------------------------------------- 첨부 목록
+_LAST_PAGE = {}   # url → 상세 페이지 HTML (list_attachments 가 받은 것을 process_item 이 주소 추출에 재사용)
 def list_attachments(src, iid, url):
     if src == 'sh':
-        s = _curl(url); m = re.search(r'initParam\.downList = (\[.*?\]);', s)
+        s = _curl(url); _LAST_PAGE[url] = s; m = re.search(r'initParam\.downList = (\[.*?\]);', s)
         return [dict(name=f['oriFileNm'], referer=url,
                      url=f"https://www.i-sh.co.kr/app/com/file/innoFD.do?brdId={f['brdId']}&seq={f['seq']}&fileTp={f['fileTp']}&fileSeq={f['fileSeq']}")
                 for f in (json.loads(m.group(1)) if m else [])]
     if src == 'soco':
-        s = _curl(url); out = {}
+        s = _curl(url); _LAST_PAGE[url] = s; out = {}
         for m in re.finditer(r'href="(/coHouse/cmmn/file/fileDown\.do\?atchFileId=\w+&(?:amp;)?fileSn=\d+)"[^>]*>\s*([^<]+?)\s*</a>', s):
             out.setdefault(H.unescape(m.group(1)), H.unescape(m.group(2)))
         return [dict(name=n, url='https://soco.seoul.go.kr' + u, referer=url) for u, n in out.items()]
     if src == 'socialhousing':
-        s = _curl(url); out = {}
+        s = _curl(url); _LAST_PAGE[url] = s; out = {}
         for m in re.finditer(r'href="(/index\.php\?module=file&(?:amp;)?act=procFileDownload[^"]+)"[^>]*>\s*([^<]+?)\s*</a>', s):
             out.setdefault(H.unescape(m.group(1)), H.unescape(m.group(2)))
         return [dict(name=n, url='https://socialhousing.kr' + u, referer=url) for u, n in out.items()]
@@ -232,9 +233,10 @@ def extract_pdf_text(path, page_outdir=None, jeonse=False):
             u['page'] = pg; u['table_index'] = ti; u['bbox'] = bbox; us.append(u)
     _fill_single_area(us, [t[0] for t in tabs])
     us = _dedup_units(us)
+    ex = addr.attach(us, '\n'.join(full))                 # 주택형 주소: 단지별 주소표 매칭 > 공고 단일 주소
     page_images = _render_pdf_pages(path, sorted({u['page'] for u in us if u.get('page')}), page_outdir) if page_outdir else {}
     info = dict(pages=sorted({p + 1 for p in pages}), tables=len(tabs), page_images=page_images)
-    structured = build_structured(kind='pdf-text', method='pdfplumber', units=us, info=info, text='\n'.join(full[:8]), page_images=page_images)
+    structured = build_structured(kind='pdf-text', method='pdfplumber', units=us, info=info, text='\n'.join(full[:8]), page_images=page_images, addresses=ex)
     return us, info, structured
 
 
@@ -242,8 +244,8 @@ def _guess_meta(text):
     """공고 본문에서 단지명·주소·접수기간·자격 휴리스틱(없으면 None). 숫자는 원문에 있을 때만."""
     t = text or ''
     meta = dict(name=None, address=None, apply_start=None, apply_end=None, eligibility=None)
-    m = re.search(r'(서울특별시\s+[가-힣]+구[^\n]{0,40})', t) or re.search(r'주\s*소\s*[:：]\s*([^\n]{5,60})', t)
-    if m: meta['address'] = re.sub(r'\s+', ' ', m.group(1)).strip()[:80]
+    ex = addr.extract(t)                                   # 라벨(주택위치·소재지 등) 붙은 서울 주소가 하나일 때만
+    meta['address'] = ex['notice'][0] if len(ex['notice']) == 1 else (ex['partial'][0] if not ex['notice'] and len(ex['partial']) == 1 else None)
     m = re.search(r'(?:단지\s*명|주택\s*명|사업\s*명)\s*[:：]?\s*([^\n]{2,40})', t)
     if m: meta['name'] = re.sub(r'\s+', ' ', m.group(1)).strip()[:60]
     # 접수 기간: 2026. 9. 29. ~ 10. 2. / 2026-10-06 ~ 2026-10-08 등
@@ -267,16 +269,18 @@ def _render_pdf_pages(path, pages_1based, outdir, dpi=120):
         if dest.exists(): out[pg] = str(dest)
     return out
 
-def build_structured(*, kind, method, units, info, text='', page_images=None, tables_meta=None):
-    """에이전트 공유용 구조화 JSON."""
+def build_structured(*, kind, method, units, info, text='', page_images=None, tables_meta=None, addresses=None):
+    """에이전트 공유용 구조화 JSON. addresses = addr.attach() 결과(전체 본문 기준) — 있으면 meta.address 를 그것으로."""
     meta = _guess_meta(text)
+    if addresses is not None:
+        meta['address'] = addresses.get('single'); meta['address_book'] = len(addresses.get('book') or {})
     us = []
     for u in units:
         us.append(dict(unit_label=u.get('unit_label'), target=u.get('target'), area_m2=u.get('area_m2'),
                        deposit=u.get('deposit'), rent=u.get('rent'), supply=u.get('supply'), lease_type=u.get('lease_type'),
                        option=u.get('option'), page=u.get('page'), table_index=u.get('table_index'),
                        bbox=u.get('bbox'), page_image=(page_images or {}).get(u.get('page')),
-                       note=u.get('note')))
+                       note=u.get('note'), address=u.get('address')))
     return dict(parser_version=PARSER_VERSION, kind=kind, method=method, meta=meta, units=us,
                 pages_rendered=sorted((page_images or {}).values()),
                 crops=info.get('crops') or [], tables=info.get('tables'),
@@ -363,8 +367,9 @@ def extract_hwp(path, kind, jeonse=False):
         for u in parse_table(t, txt, jeonse=jeonse):
             u['table_index'] = ti; us.append(u)
     us = _dedup_units(us)
+    ex = addr.attach(us, txt)
     info = dict(tables=len(rent_tabs), method=method, rhwp=bool(method == 'rhwp'))
-    structured = build_structured(kind=kind, method=method, units=us, info=info, text=txt)
+    structured = build_structured(kind=kind, method=method, units=us, info=info, text=txt, addresses=ex)
     return us, info, structured
 
 def extract_ocr(path, kind, outdir, max_pages=12):
@@ -421,11 +426,11 @@ def render_pages_for_agent(path, kind, outdir, max_pages=12):
 def _now(): return dt.datetime.now(hdb.KST).isoformat(timespec='seconds')
 def save_units(con, src, iid, origin, units, doc_id):
     for u in units:
-        con.execute('INSERT OR REPLACE INTO units(source,item_id,unit_label,target,area_m2,deposit,rent,note,origin,verified,supply,doc_id,lease_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        con.execute('INSERT OR REPLACE INTO units(source,item_id,unit_label,target,area_m2,deposit,rent,note,origin,verified,supply,doc_id,lease_type,address) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (src, iid, u['unit_label'], u['target'], u['area_m2'], u['deposit'], u['rent'], u.get('note'), origin, 0, u.get('supply'), doc_id,
-                     u.get('lease_type') or ('jeonse' if not u['rent'] else 'monthly')))
+                     u.get('lease_type') or ('jeonse' if not u['rent'] else 'monthly'), u.get('address')))
 
-def process_file(con, src, iid, f, cfg, force_ocr=False, lease_hint=None):
+def process_file(con, src, iid, f, cfg, force_ocr=False, lease_hint=None, force=False):
     name = f['name']; d = DOCS / src / iid; d.mkdir(parents=True, exist_ok=True)
     row = dict(source=src, item_id=iid, file_url=f['url'], file_name=name, processed_at=_now(), verified='auto', parser_version=PARSER_VERSION)
     if FORM.search(name) and not re.search(r'공고', name):
@@ -442,7 +447,7 @@ def process_file(con, src, iid, f, cfg, force_ocr=False, lease_hint=None):
     same = con.execute("""SELECT * FROM documents WHERE sha256=? AND parser_version=? AND status IN ('ok','no_table')
                           AND NOT (source=? AND item_id=? AND file_url=?) ORDER BY doc_id LIMIT 1""",
                        (sha, PARSER_VERSION, src, iid, f['url'])).fetchone()
-    if same and not force_ocr:
+    if same and not (force_ocr or force):
         us = [dict(r) for r in con.execute('SELECT * FROM units WHERE doc_id=?', (same['doc_id'],))]
         row.update(status='dup_hash', method=same['method'], summary=json.dumps(dict(copied_from=same['doc_id'], units=len(us)), ensure_ascii=False),
                    structured_json=same['structured_json'])
@@ -450,7 +455,7 @@ def process_file(con, src, iid, f, cfg, force_ocr=False, lease_hint=None):
     # 자기 자신 이전 처리(같은 URL)가 현재 버전이면 재파싱 스킵 — process_item 레벨에서 주로 처리
     self_hit = con.execute("""SELECT * FROM documents WHERE source=? AND item_id=? AND file_url=? AND sha256=? AND parser_version=? AND status IN ('ok','no_table')""",
                            (src, iid, f['url'], sha, PARSER_VERSION)).fetchone()
-    if self_hit and not force_ocr:
+    if self_hit and not (force_ocr or force):          # force: process_item 이 auto 행을 먼저 지우므로 반드시 재파싱
         us = [dict(r) for r in con.execute('SELECT * FROM units WHERE doc_id=?', (self_hit['doc_id'],))]
         row.update(status='ok' if us else 'no_table', method=self_hit['method'], summary=self_hit['summary'], structured_json=self_hit['structured_json'])
         return row, [(u.get('origin') or 'auto', u) for u in us]
@@ -489,19 +494,22 @@ def upsert_doc(con, row):
     return con.execute('SELECT doc_id FROM documents WHERE source=? AND item_id=? AND file_url=?', (row['source'], row['item_id'], row['file_url'])).fetchone()[0]
 
 def process_item(con, src, iid, url, cfg, force=False, force_ocr=False, lease_hint=None):
-    """한 공고의 첨부 전체 처리. 이미 처리 기록이 있으면(force 아니면) 네트워크 없이 skip. returns summary dict"""
+    """한 공고의 첨부 전체 처리. 이미 처리 기록이 있으면(force 아니면) 네트워크 없이 skip.
+    returns summary dict (+ address: 공고 단위 자동 주소 = 첨부 단일 주소 > 상세 페이지 '주택위치/소재지')"""
     if not force:
         rows = list(con.execute('SELECT parser_version, status FROM documents WHERE source=? AND item_id=?', (src, iid)))
         if rows and all((r['parser_version'] == PARSER_VERSION) or r['status'] in ('skipped_form', 'unsupported', 'no_attachment', 'dup_hash') for r in rows):
             return dict(skipped=True, reason='cache', parser_version=PARSER_VERSION)
     files = list_attachments(src, iid, url)
+    page = _LAST_PAGE.pop(url, '')
+    page_addr = addr.page_address(page) if src != 'socialhousing' else None   # 사회주택협회 페이지엔 다른 방 주소도 섞임 → 목록 '주소' 열 사용(collect)
     if not files:
         upsert_doc(con, dict(source=src, item_id=iid, file_url='', status='no_attachment', kind='none', method='none', processed_at=_now())); con.commit()
-        return dict(files=0)
+        return dict(files=0, address=page_addr)
     con.execute("DELETE FROM units WHERE source=? AND item_id=? AND origin IN ('auto','ocr')", (src, iid))
-    res, used = [], set()
+    res, used, doc_addr = [], set(), None
     for f in files[:cfg.get('docs', {}).get('max_files_per_item', 4)]:
-        try: row, us = process_file(con, src, iid, f, cfg, force_ocr, lease_hint)
+        try: row, us = process_file(con, src, iid, f, cfg, force_ocr, lease_hint, force=force)
         except Exception as e:
             row, us = dict(source=src, item_id=iid, file_url=f['url'], file_name=f['name'], status='error', error=f'{type(e).__name__}: {e}'[:300], processed_at=_now()), []
         did = upsert_doc(con, row)
@@ -511,8 +519,10 @@ def process_item(con, src, iid, url, cfg, force=False, force_ocr=False, lease_hi
         for origin in ('auto', 'ocr'):
             save_units(con, src, iid, origin, [u for o, u in us if o == origin], did)
         res.append((f['name'], row['status'], len(us)))
+        try: doc_addr = doc_addr or (json.loads(row.get('structured_json') or '{}').get('meta') or {}).get('address')
+        except Exception: pass
     con.commit()
-    return dict(files=len(files), results=res)
+    return dict(files=len(files), results=res, address=doc_addr or page_addr)   # 첨부(도로명 위주) > 상세 페이지
 
 if __name__ == '__main__':
     con = hdb.connect(); a = sys.argv[1:]; cfg = hdb.load_cfg()

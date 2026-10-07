@@ -2,7 +2,7 @@
 """수집 → 정규화/중복제거 → 판정 → housing.db 스냅샷 저장 (같은 collected_date 재실행 시 upsert).
 사용: python collect.py [--max-deposit N] [--max-rent N] [--date YYYY-MM-DD] [--only sh,lh]"""
 import argparse, json, re, hashlib, time, datetime as dt, traceback
-import hdb, sources, docs
+import hdb, sources, docs, addr
 
 RELEVANT = re.compile(r'청년|행복주택|안심주택|매입임대|사회주택|도시형생활|원룸|1~2인|잔여세대|토지지원|토지임대부|장기미임대|재개발임대|국민임대|통합공공')
 # (구) EXCLUDE 하나에 섞여 있던 규칙을 셋으로 분리 — 판정은 제목·소스 카테고리만 사용(본문 키워드 금지: 월세 공고문에도 '전세대 전액보증' 등이 흔함)
@@ -125,10 +125,12 @@ def run(over=None, date=None, only=None):
             old = con.execute('SELECT * FROM items WHERE source=? AND dedup_key=? AND item_id<>? ORDER BY last_seen_date DESC LIMIT 1', (src, it['dedup_key'], iid)).fetchone()
             if old:
                 repost_of = old['item_id']
-                con.execute('INSERT OR IGNORE INTO item_meta SELECT source,?,name,gu,station,housing_type,apply_start,apply_end,supply_count,eligibility,note,verified_at FROM item_meta WHERE source=? AND item_id=?', (iid, src, old['item_id']))
+                MC = 'name,gu,station,housing_type,apply_start,apply_end,supply_count,eligibility,note,verified_at,address'
+                con.execute(f'INSERT OR IGNORE INTO item_meta(source,item_id,{MC}) SELECT source,?,{MC} FROM item_meta WHERE source=? AND item_id=?', (iid, src, old['item_id']))
                 if not con.execute('SELECT 1 FROM units WHERE source=? AND item_id=?', (src, iid)).fetchone():
-                    con.execute('INSERT INTO units(source,item_id,unit_label,target,area_m2,deposit,rent,note,origin,verified,supply,doc_id) SELECT source,?,unit_label,target,area_m2,deposit,rent,note,origin,verified,supply,doc_id FROM units WHERE source=? AND item_id=?', (iid, src, old['item_id']))
-                con.execute('INSERT INTO items(source,item_id,first_seen_date,last_seen_date,last_hash,notified_fit,dedup_key) VALUES(?,?,?,?,?,?,?)', (src, iid, old['first_seen_date'], cd, old['last_hash'], old['notified_fit'], it['dedup_key']))
+                    UC = 'unit_label,target,area_m2,deposit,rent,note,origin,verified,supply,doc_id,lease_type,address'
+                    con.execute(f'INSERT INTO units(source,item_id,{UC}) SELECT source,?,{UC} FROM units WHERE source=? AND item_id=?', (iid, src, old['item_id']))
+                con.execute('INSERT INTO items(source,item_id,first_seen_date,last_seen_date,last_hash,notified_fit,dedup_key,address) VALUES(?,?,?,?,?,?,?,?)', (src, iid, old['first_seen_date'], cd, old['last_hash'], old['notified_fit'], it['dedup_key'], old['address']))
                 reg = con.execute('SELECT * FROM items WHERE source=? AND item_id=?', (src, iid)).fetchone()
         meta = con.execute('SELECT * FROM item_meta WHERE source=? AND item_id=?', (src, iid)).fetchone()
         meta = dict(meta) if meta else {}
@@ -146,15 +148,19 @@ def run(over=None, date=None, only=None):
         if src == 'seoulportal' and st == '모집중' and not meta.get('apply_end'): st = '포털 모집중(접수기간 확인 필요)'
         status = st or ('마감' if closed else ('접수예정' if apply_start and apply_start > cd else ('모집중(추정)' if end_d or apply_start else '확인 필요')))
         relevant = is_relevant(it, cfg); lease = lease_of(it); ntg = notice_targets(it)
-        dc = cfg.get('docs', {})
+        dc = cfg.get('docs', {}); auto_addr = None          # 공고 단위 자동 주소(이번 실행에서 새로 얻은 값; None=변화 없음, ''=찾아봤지만 없음)
         if relevant and lease != 'support' and not closed and dc.get('enabled', True) and src in docs.SUPPORTED and doc_budget[0] > 0:   # 사람 기록이 있어도 1회 처리(누락 옵션 탐지용)
             try:
                 t1 = time.time(); r = docs.process_item(con, src, iid, it['url'], cfg, **({'lease_hint': 'jeonse'} if lease == 'jeonse' else {}))
+                if r.get('address'): auto_addr = r['address']
                 if not r.get('skipped'):
                     doc_budget[0] -= 1; doc_log.append(dict(item=f'{src}:{iid}', sec=round(time.time() - t1, 1), **r))
                 units = [dict(u) for u in con.execute('SELECT * FROM units WHERE source=? AND item_id=?', (src, iid))]
             except Exception as e:
                 doc_log.append(dict(item=f'{src}:{iid}', error=f'{type(e).__name__}: {e}'[:200]))
+        if relevant and src == 'socialhousing' and it.get('address'): auto_addr = addr.find(it['address']) or auto_addr   # 목록 '주소' 열
+        if relevant and src == 'lh' and not closed and (reg is None or reg['address'] is None) and not auto_addr:
+            auto_addr = sources.lh_address(it, cfg) or ''      # LH 상세 '소재지'(단일 단지) — 공고당 1회만 조회
         fm = fj = None; bm = bj = None; rm = rj = None; basis = 'none'
         if not relevant:
             fit, reason, best, basis = 'irrelevant', '키워드 필터 제외', None, 'none'
@@ -182,8 +188,12 @@ def run(over=None, date=None, only=None):
                 fit, reason, best = min(cands, key=lambda x: hdb.FIT_RANK.get(x[0], 9))   # 월세 우선(동률 시)
             else:
                 fit, reason, best = ('closed' if closed else ('unknown' if not units else 'no')), '선택한 임대유형에 해당하는 옵션 없음', None
-        best_json = json.dumps({k: ({x: b.get(x) for x in ('unit_label', 'target', 'area_m2', 'deposit', 'rent', 'conv', 'origin')} if b else None)
+        item_addr = auto_addr or (reg['address'] if reg is not None and reg['address'] else None)
+        gu0 = meta.get('gu') or it.get('gu')
+        best_json = json.dumps({k: (dict({x: b.get(x) for x in ('unit_label', 'target', 'area_m2', 'deposit', 'rent', 'conv', 'origin')},
+                                         address=addr.pick(b, units, meta, item_addr, gu0)) if b else None)
                                 for k, b in (('monthly', bm), ('jeonse', bj))}, ensure_ascii=False) if relevant else None
+        laddr = addr.pick(best, units, meta, item_addr, gu0) if relevant else None
         enote = elig_note(it, lease, meta) if relevant else None
         due = int(bool(relevant and not closed and end_d and 0 <= (end_d - today).days <= cfg['due_soon_days']))
         if relevant and fit == 'program' and status in ('확인 필요',) and it.get('status'): status = it['status']
@@ -192,14 +202,15 @@ def run(over=None, date=None, only=None):
             con.execute('INSERT INTO items(source,item_id,first_seen_date,last_seen_date,last_hash,dedup_key) VALUES(?,?,?,?,?,?)', (src, iid, cd, cd, h, it['dedup_key'])); first = cd
         else:
             first = reg['first_seen_date']; con.execute('UPDATE items SET last_seen_date=?, dedup_key=? WHERE source=? AND item_id=?', (cd, it['dedup_key'], src, iid))
+        if auto_addr is not None: con.execute('UPDATE items SET address=? WHERE source=? AND item_id=?', (auto_addr, src, iid))
         prev = con.execute('SELECT hash FROM listings WHERE source=? AND item_id IN (?,?) AND collected_date<? ORDER BY collected_date DESC LIMIT 1', (src, iid, repost_of or iid, cd)).fetchone()
         is_new = int(first == cd and not repost_of); is_changed = int(bool(repost_of) or bool(prev and prev['hash'] != h))
         area = best['area_m2'] if best else None; dep = best['deposit'] if best else None; rent = best['rent'] if best else None
         rpm = int(round(rent * 10000 / area)) if best and area else None
         con.execute('''INSERT INTO listings(collected_date,source,item_id,run_id,title,category,name,gu,station,area_m2,deposit,rent,rent_per_m2_won,
             posted,apply_start,apply_end,status,relevant,fit,fit_reason,fit_basis,crit_max_deposit,crit_max_rent,crit_near_deposit,crit_near_rent,
-            is_new,is_changed,is_due_soon,url,hash,updated_at,lease_type,targets,fit_monthly,reason_monthly,fit_jeonse,reason_jeonse,best_json,elig_note,extra_note)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            is_new,is_changed,is_due_soon,url,hash,updated_at,lease_type,targets,fit_monthly,reason_monthly,fit_jeonse,reason_jeonse,best_json,elig_note,extra_note,address)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(collected_date,source,item_id) DO UPDATE SET run_id=excluded.run_id,title=excluded.title,category=excluded.category,name=excluded.name,
             gu=excluded.gu,station=excluded.station,area_m2=excluded.area_m2,deposit=excluded.deposit,rent=excluded.rent,rent_per_m2_won=excluded.rent_per_m2_won,
             posted=excluded.posted,apply_start=excluded.apply_start,apply_end=excluded.apply_end,status=excluded.status,relevant=excluded.relevant,fit=excluded.fit,
@@ -207,11 +218,11 @@ def run(over=None, date=None, only=None):
             crit_near_rent=excluded.crit_near_rent,is_new=excluded.is_new,is_changed=excluded.is_changed,is_due_soon=excluded.is_due_soon,url=excluded.url,
             hash=excluded.hash,updated_at=excluded.updated_at,lease_type=excluded.lease_type,targets=excluded.targets,fit_monthly=excluded.fit_monthly,
             reason_monthly=excluded.reason_monthly,fit_jeonse=excluded.fit_jeonse,reason_jeonse=excluded.reason_jeonse,best_json=excluded.best_json,
-            elig_note=excluded.elig_note,extra_note=excluded.extra_note''',
+            elig_note=excluded.elig_note,extra_note=excluded.extra_note,address=excluded.address''',
             (cd, src, iid, run_id, it['title'], it.get('category'), meta.get('name'), meta.get('gu'), meta.get('station'), area, dep, rent, rpm,
              it.get('posted'), apply_start, apply_end, status, int(relevant), fit, reason, basis, cfg['max_deposit_manwon'], cfg['max_rent_manwon'], nd, nr,
              is_new, is_changed, due, it.get('url'), h, dt.datetime.now(hdb.KST).isoformat(timespec='seconds'),
-             lease, ','.join(hdb.TARGET_LABEL[x] for x in ('youth', 'newlywed') if x in ntg), fm, rm, fj, rj, best_json, enote, it.get('extra_note')))
+             lease, ','.join(hdb.TARGET_LABEL[x] for x in ('youth', 'newlywed') if x in ntg), fm, rm, fj, rj, best_json, enote, it.get('extra_note'), laddr))
         con.execute('UPDATE items SET last_hash=? WHERE source=? AND item_id=?', (h, src, iid))
     # 이번 실행에서 대표가 아닌(중복) 행은 같은 날 이전 실행분에서 남아있으면 제거 → 멱등
     dups = [(cd, i['source'], i['item_id']) for i in items if i.get('dup_of')]

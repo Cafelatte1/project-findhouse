@@ -3,7 +3,8 @@
 점검: 판정 로직, 단위 변환, 중복제거, 소스 실패 격리, 같은날 재실행 멱등성, 재게시 승계, 첨부 표 파서,
       판정 근거(basis), LH 구조 변경 감지, documents sha256/parser_version 캐시, 이미지 공고(OCR 끔) 처리, 리포트 템플릿,
       임대유형(월세/전세)·대상(청년/신혼부부) 축: 설정 하위호환, 관련성 동치(구 규칙), 전세 표 파서, 공급대상 열, 전세 판정·🔁 전환,
-      혼합 공고의 블록별 판정, 알림 태그, 스키마 마이그레이션 멱등, 채팅 블록 렌더, HUG 공고 파싱, 서울주거포털 주석 제거.
+      혼합 공고의 블록별 판정, 알림 태그, 스키마 마이그레이션 멱등, 채팅 블록 렌더, HUG 공고 파싱, 서울주거포털 주석 제거,
+      주소(정규화·주소표 매칭·선택 순서·근사·평문 렌더·collect 저장).
 사용: python selftest.py   (실패가 있으면 exit 1)"""
 import tempfile, shutil, json, sys
 from pathlib import Path
@@ -146,6 +147,9 @@ ok(doc['parser_version'] == docs.PARSER_VERSION and sj.get('units') and sj['unit
 pv = docs.PARSER_VERSION; docs.PARSER_VERSION = pv + '-test'
 r4 = docs.process_item(con, 'soco', 'A', 'x', cfg); docs.PARSER_VERSION = pv
 ok(not r4.get('skipped') and n_extract[0] == 2, f'parser_version 변경 시 재처리 extract={n_extract[0]}')
+docs.process_item(con, 'soco', 'A', 'x', cfg, force=True)
+nA = con.execute("SELECT COUNT(*) FROM units WHERE item_id='A' AND origin='auto'").fetchone()[0]
+ok(n_extract[0] == 3 and nA == 2, f'--force 재처리: 캐시 무시하고 재파싱·auto 행 유지 extract={n_extract[0]} units={nA}')
 # 10 이미지형 공고 + OCR 끔(기본) → needs_agent, 숫자 없음 → 판정 unknown(가격 미확인)
 docs.classify = lambda p, n: 'pdf-image'
 con = fresh_db('t10'); r = docs.process_item(con, 'sh', 'IMG', 'x', cfg)
@@ -234,7 +238,7 @@ ok(report.unit_place('강동구 서도휴빌(2차) 102동 42C 강동구 성내�
 it = report._item(dict(title='2026년 재개발임대주택 일반모집 공고(2026. 9. 9.)', source='sh', url='u', apply_start=None, apply_end=None, elig_note='세대 기준 공고(무주택세대구성원 등) — 자격 원문 확인',
                        reason_monthly='[자동추출] 동소문한진 562/6.63만원', best_json=json.dumps({'monthly': dict(unit_label='동소문한진', area_m2=32.49, deposit=562, rent=6.63)})),
                   'monthly', cb, show_target=False)
-ok(it.split('\n') == ['• 🏠 **[SH 재개발임대 일반모집](u)**', '  - 동소문한진 · 32.49㎡', '  - 보증금 562만 / 월세 6.63만 · 자동추출', '  - 무주택세대 자격'],
+ok(it.split('\n') == ['• 🏠 **[SH 재개발임대 일반모집](u)**', '  - 주소(근사): 서울 동소문한진', '  - 동소문한진 · 32.49㎡ · 보증금 562만 / 월세 6.63만 · 자동추출', '  - 무주택세대 자격'],
    f'알림 항목: 사업명 링크 + 단지명 첫 줄 + 압축 자격, 모르는 접수기간 줄 생략 {it!r}')
 
 # 15 전세 판정
@@ -275,7 +279,7 @@ lines = md.split('\n')
 ok(lines[0] == '**서울 청년·신혼부부 월세·전세 수집** · 2026-10-06' and lines[1] == '월세 부합 1 / 전세 부합 1 · 공고 1 / 지원 프로그램 1', f'채팅: 제목·한 줄 요약 {lines[:2]}')
 ok(md.index('**월세**') < md.index('• 기준: 보증금 ≤3,000만 · 월세 ≤50만') < md.index('**전세**') < md.index('• 기준: 전세 보증금 ≤2억') < md.index('📋 **지원 프로그램**'),
    '채팅: 월세 블록 → 전세 블록 → 지원 프로그램 순서·블록별 기준줄')
-ok('🔁 전환 · 보증금 1억 8,000만 / 월세 5만' in md and md.count('✅ **조건 부합** (1)') == 2 and '서울 420호' in md.split('⚠️ **공고 단위 확인** (1)')[1]
+ok('🔁 전환 · 40㎡ · 보증금 1억 8,000만 / 월세 5만' in md and md.count('✅ **조건 부합** (1)') == 2 and '서울 420호' in md.split('⚠️ **공고 단위 확인** (1)')[1]
    and '· 신혼부부' not in md.split('**전세**')[0] and '· 신혼부부' in md.split('**전세**')[1], '채팅: 🔁 전환은 전세 블록·블록별 ✅·대상 태그=주택형 대상·HUG 공고 단위')
 cy = hdb.normalize_cfg(dict(TEST_CFG))
 md1 = report.render_chat(cd='2026-10-06', cfg=cy, blocks={'monthly': bm}, support=[], fails={})
@@ -344,6 +348,67 @@ cxj = dict(cb, exclude_gu=['강남구'])
 ok(hdb.judge_jeonse([dict(G('강남구 E', 15000, 0), lease_type='jeonse')], {}, False, cxj)[0] == 'excluded_region'
    and hdb.judge_jeonse([dict(G('강남구 E', 15000, 0), lease_type='jeonse'), dict(G('마포구 F', 19000, 0), lease_type='jeonse')], {}, False, cxj)[2]['unit_label'] == '마포구 F',
    '전세 판정도 주택형 단위 제외 구 적용')
+# 22 주소: 정규화·라벨/사무실 구분·단지별 주소표·주택형 매칭·선택 순서·근사·렌더(평문, 링크 없음)·collect 저장
+import addr
+ok(addr.find('위   치   서울시 양천구 신정로13가길 6(신정동1289-2)') == '서울 양천구 신정로13가길 6'
+   and addr.find('서울특별시 강동구 구천면로 46길 38, 리츠하우스 203호') == '서울 강동구 구천면로46길 38'
+   and addr.find('서울 광진구 구의강변로57 센텀힐스한강') == '서울 광진구 구의강변로 57'
+   and addr.find('1) 위치 : 서울시 마포구 성산동 611-11번지') == '서울 마포구 성산동 611-11', '주소 정규화(도로명·지번, 괄호·건물명·호수 제거)')
+T22 = """▣ 주택위치
+  위   치             서울시 양천구 신정로13가길 6(신정동1289-2)
+ - 주소 : (06336) 서울특별시 강남구 개포로 621 서울주택도시개발공사 1층 서류심사실
+관악/동작                 ○ 주소 : 동작구 상도로53길 70 상도SH빌 임대상가 101호"""
+ex = addr.extract(T22)
+ok(ex['notice'] == ['서울 양천구 신정로13가길 6'], f"라벨 주소만·SH 본사/센터(층·상가) 주소 제외 {ex['notice']}")
+BOOK = """연번              단지명             도로명주소            전화번호          인근 전철역
+42     래미안미드카운티(답십리18구역)             동대문구 답십리로 141        3394-6830~1       청량리역
+                                       고산자로29길 18
+44           래미안용두1차                                        959-1472        용두역         190m
+45        래미안위브(답십리16)               동대문구 답십리로 130         2249-8682        답십리역
+118         동소문한진            성북구 성북로4길 52         921-6985        한성대입구     1.5km
+119         래미안석관             성북구 화랑로 214         962-6028        돌곶이역      387m
+120   래미안센터피스아파트(길음2구역)     숭인로 50 (길음동 1288)    02-982-1500     미아사거리역
+121   래미안아트리치아파트(석관2구역)      성북구 돌곶이로8길 22      02-3295-5766,7    신이문역"""
+bk = addr.extract(BOOK)['book']
+ok(addr.match('동소문한진 최대전환', bk) == '서울 성북구 성북로4길 52' and addr.match('[일반공급] 래미안용두1차 #2', bk) == '서울 동대문구 고산자로29길 18'
+   and addr.match('래미안센터피스아파트 (길음2구역)', bk) == '서울 성북구 숭인로 50' and addr.match('없는단지', bk) is None,
+   '단지별 주소표: 라벨 매칭·줄바꿈 행·구 없는 행(앞뒤 구로 채움)·이름에 센터 포함')
+us22 = [dict(unit_label='동소문한진'), dict(unit_label='래미안석관 최대전환'), dict(unit_label='row3')]
+ex = addr.attach(us22, BOOK + '\n' + T22)
+ok([u['address'] for u in us22] == ['서울 성북구 성북로4길 52', '서울 성북구 화랑로 214', None], f"주소표가 있으면 단일 주소로 채우지 않음 {[u['address'] for u in us22]}")
+us22 = [dict(unit_label='39㎡'), dict(unit_label='39㎡ (+) 최대전환')]; addr.attach(us22, T22)
+ok(all(u['address'] == '서울 양천구 신정로13가길 6' for u in us22), '단일 단지 공고: 모든 주택형에 공고 주소')
+us22 = [dict(unit_label='302호')]; addr.attach(us22, '빈집활용 토지임대부 사회주택 : 쌍문생활 (쌍문동 460-50) 모집 공고문')
+ok(us22[0]['address'] == '쌍문동 460-50' and addr.finalize(us22[0]['address'], '도봉구') == '서울 도봉구 쌍문동 460-50', '구 없는 지번 + 공고 구 → 완성 주소')
+us22 = [dict(unit_label='강동구 서도휴빌(2차) 102동 42C 강동구 성내동 440-26 둔촌동역 O X 보증금50%')]; addr.attach(us22, T22)
+ok(us22[0]['address'] == '서울 강동구 성내동 440-26', f"라벨 속 주소(매입임대 표 주소 열)가 최우선 {us22[0]['address']}")
+UA = lambda l, a=None: dict(unit_label=l, address=a)
+ok(addr.pick(UA('h'), [UA('h'), UA('a', '서울 중구 다산로 32')], {'address': '서울 마포구 성미산로 1'}) == '서울 마포구 성미산로 1'
+   and addr.pick(UA('동소문한진'), [UA('동소문한진'), UA('동소문한진', '서울 성북구 성북로4길 52'), UA('래미안석관', '서울 성북구 화랑로 214')], {}) == '서울 성북구 성북로4길 52'
+   and addr.pick(UA('x'), [UA('x')], {}, '서울 강북구 오현로 208') == '서울 강북구 오현로 208'
+   and addr.pick(UA('x'), [UA('x'), UA('y', '서울 성북구 화랑로 214'), UA('z', '서울 중구 다산로 32')], {}) is None,
+   '주소 선택: 사람 meta > 대표 주택형(같은 단지명 auto 행) > 공고 단위, 여러 단지면 추측 안 함')
+ok(addr.approx('함께주택4호 401-3호(쉐어)', '마포구') == '서울 마포구 함께주택4호' and addr.approx('신정도시마을 잔여세대', '양천구') == '서울 양천구 신정도시마을', '근사 주소: 서울 구 단지명')
+R22 = dict(title='2026년 신정도시마을 잔여세대 입주자모집공고(26. 9. 23.)', source='sh', url='u', gu='양천구', station='신정네거리역', apply_start='2026-10-06', apply_end='2026-10-08',
+           is_due_soon=1, reason_monthly='', address='서울 양천구 신정로13가길 6',
+           best_json=json.dumps({'monthly': dict(unit_label='39㎡', area_m2=39, deposit=1760, rent=39, address='서울 양천구 신정로13가길 6')}))
+it = report._item(R22, 'monthly', cfg, show_target=False).split('\n')
+ok(it[1] == '  - 주소: 서울 양천구 신정로13가길 6' and it[2] == '  - 신정네거리역 · 39㎡ · 보증금 1,760만 / 월세 39만' and len(it) == 4 and 'http' not in it[1] and '양천구 ·' not in it[2],
+   f'알림: 주소 줄(평문·링크 없음) + 역·면적·가격 한 줄, 최대 3줄 {it}')
+it = report._item(dict(R22, address=None, best_json=json.dumps({'monthly': dict(unit_label='39㎡', area_m2=39, deposit=1760, rent=39)})), 'monthly', cfg, show_target=False).split('\n')
+ok(it[1] == '  - 주소(근사): 서울 양천구 신정도시마을', f'확정 주소 없으면 주소(근사) 표기 {it[1]}')
+it = report._item(dict(title='2026년 청년 매입임대주택 입주자 모집공고', source='sh', url='u', best_json=json.dumps({'monthly': dict(unit_label='row1', deposit=500, rent=10)})), 'monthly', cfg, show_target=False)
+ok('주소' not in it, '여러 단지 사업 공고에서 단지를 모르면 주소 줄 생략')
+ok(report.notice_name(dict(source='sh', title='NEW [토지임대부 사회주택] 옥류서원 입주자 모집 공고문'))[0] == '옥류서원'
+   and '확인 필요' not in report._item(dict(R22, station='확인 필요'), 'monthly', cfg, show_target=False), "알림 이름: SH 'NEW' 배지 제거·역 자리표시 생략")
+con = fresh_db('t22'); ok(all('address' in [r[1] for r in con.execute(f'PRAGMA table_info({t})')] for t in ('units', 'item_meta', 'items', 'listings')), '마이그레이션: address 열(units·item_meta·items·listings)')
+sources.ALL = {'socialhousing': lambda c: [dict(source='socialhousing', item_id='9001', title='청년 테스트 사회주택 입주자 모집', status='모집중',
+                                               address='03034 서울 종로구 필운대로9가길 45 (서울 종로구 옥인동 47-3)', gu='종로구', url='u9')]}
+units.put_unit(con, 'socialhousing', '9001', '101호', 20, 1500, 30, '청년'); con.commit()
+collect.run(date='2026-10-07'); sources.ALL = orig
+L22 = dict(con.execute("SELECT l.address, l.best_json, i.address AS ia FROM listings l JOIN items i USING(source,item_id) WHERE item_id='9001'").fetchone())
+ok(L22['address'] == L22['ia'] == '서울 종로구 필운대로9가길 45' and json.loads(L22['best_json'])['monthly']['address'] == '서울 종로구 필운대로9가길 45',
+   f'collect: 사회주택협회 목록 주소 → items·listings·best_json {L22}')
 
 shutil.rmtree(ROOT)
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAIL'}")

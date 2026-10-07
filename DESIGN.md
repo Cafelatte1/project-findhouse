@@ -122,11 +122,11 @@ SQLite `housing.db`. 같은 `collected_date` 재실행은 `listings` upsert로 �
 | 테이블 | 역할 | 핵심 컬럼 |
 |---|---|---|
 | `runs` | 실행 1회 | `collected_date`, `counts_json`, `errors_json`, 기준 금액 |
-| `items` | 공고 영구 레지스트리 | `first_seen`/`last_seen`, `notified_fit`(월세) / `notified_jeonse` / `notified_support`, `dedup_key` |
-| `item_meta` | 사람이 확인한 단지·일정·자격 메모 | `name`, `gu`, `station`, `apply_*`, `eligibility` |
-| `units` | 주택형·보증금비율 옵션 1행 = 1레코드 (만원) | `origin`=`human`\|`auto`\|`ocr`, `verified`, `doc_id`, `target`, **`lease_type`**(전세 행은 rent=0) |
+| `items` | 공고 영구 레지스트리 | `first_seen`/`last_seen`, `notified_fit`(월세) / `notified_jeonse` / `notified_support`, `dedup_key`, `address`(공고 단위 자동 주소; `''`=조회했지만 없음) |
+| `item_meta` | 사람이 확인한 단지·일정·자격 메모 | `name`, `gu`, `station`, `apply_*`, `eligibility`, `address`(사람 확인 주소 — 자동 주소보다 우선) |
+| `units` | 주택형·보증금비율 옵션 1행 = 1레코드 (만원) | `origin`=`human`\|`auto`\|`ocr`, `verified`, `doc_id`, `target`, **`lease_type`**(전세 행은 rent=0), `address`(단지 주소) |
 | `documents` | 첨부 처리 이력·캐시 | `sha256`, **`parser_version`**, `structured_json`, `kind`, `status` |
-| `listings` | 일별 스냅샷·판정 | `fit`(유형별 중 최선), `fit_monthly`/`reason_monthly`, `fit_jeonse`/`reason_jeonse`, `best_json`(유형별 대표 옵션·🔁 `conv`), `lease_type`, `targets`, `elig_note`, `extra_note`, `fit_basis`, `is_new`/`is_changed`/`is_due_soon`, 대표 면적·가격 |
+| `listings` | 일별 스냅샷·판정 | `fit`(유형별 중 최선), `fit_monthly`/`reason_monthly`, `fit_jeonse`/`reason_jeonse`, `best_json`(유형별 대표 옵션·🔁 `conv`), `lease_type`, `targets`, `elig_note`, `extra_note`, `fit_basis`, `is_new`/`is_changed`/`is_due_soon`, 대표 면적·가격, `address`(대표 주택형 기준 확정 주소; `best_json`의 유형별 `address`도 같음) |
 
 **판정 근거 선택 (`pick_units`):** `human` 값이 하나라도 있으면 그것만 → 없으면 `auto` → 없으면 `ocr`.  
 **fit 값:** `match` / `near` / `no` / `unknown` / `unverified`(OCR 잠정) / `program`(지원 프로그램, 가격 판정 없음) / `closed` / `closed_match` / `excluded_region` / `irrelevant`.  
@@ -168,7 +168,8 @@ SQLite `housing.db`. 같은 `collected_date` 재실행은 `listings` upsert로 �
 - **에이전트(또는 사람)가 페이지/크롭 이미지를 직접 보고** `units.py`로 `human` 값을 기록한다.
 
 ### 5.4 캐시
-- 키 = **`sha256` + `parser_version`** (`docs.PARSER_VERSION`, 현재 `2.1`)  
+- 키 = **`sha256` + `parser_version`** (`docs.PARSER_VERSION`, 현재 `2.2` — 2.2에서 주소 추출 추가, 진행 중 공고의 첨부는 다음 실행 때 1회 재파싱)
+- `docs.py process … --force`는 캐시를 무시하고 재파싱한다  
 - 같은 공고·현재 버전이면 재다운로드·재파싱 없음  
 - 다른 공고와 해시·버전이 같으면 `dup_hash`로 `structured_json`·units 복사  
 - 파서/스키마를 바꾸면 `PARSER_VERSION`만 올려 무효화
@@ -177,11 +178,21 @@ SQLite `housing.db`. 같은 `collected_date` 재실행은 `listings` upsert로 �
 
 ```text
 parser_version, kind, method,
-meta { name, address, apply_start, apply_end, eligibility },
+meta { name, address, address_book, apply_start, apply_end, eligibility },
 units [{ unit_label, target, area_m2, deposit, rent, lease_type, supply, option,
-         page, table_index, bbox, page_image, note }],
+         page, table_index, bbox, page_image, note, address }],
 pages_rendered[], crops[], text_excerpt
 ```
+
+### 5.5 주소 (`addr.py`, 외부 API·키 없음)
+알림에 단지 주소를 평문으로 넣어 지도 앱에 붙여 넣을 수 있게 한다. 정규화 형식 `서울 {구} {도로명} {번호}` 또는 `서울 {구} {동} {지번}` (괄호 지번·건물명·호수는 버림).
+- **공고 단일 주소**: 본문에서 라벨(`주택위치`·`공급위치`·`위치`·`소재지`·`공급주택`·`주소`) 뒤에 오는 서울 주소. SH 본사·LH 서울지역본부·권역 센터처럼 `공사/센터/접수/우편`·`N층/빌딩/상가`가 붙은 사무실 주소는 제외. 라벨 주소가 정확히 1개일 때만 쓰고, 없으면 `쌍문생활 (쌍문동 460-50)` 같은 구 없는 지번(알림에서 공고 구를 붙임).
+- **라벨 속 주소**: 매입임대 표처럼 주택형 행에 `OO구 OO동 123` 주소 열이 있으면 그 행의 주소(최우선).
+- **단지별 주소표**(재개발임대 ‘단지별 상세주소’ 등): `연번  단지명  OO구 OO로 12  전화…` 행을 `{정규화 단지명: 주소}`로 읽고(줄바꿈 행·구 없는 행은 앞뒤 행 구로 보정, 3행 이상일 때만 표로 인정) 주택형 라벨의 단지명과 매칭(정확 > 접두 일치). 주소표가 있으면 단일 주소로 채우지 않는다(다른 단지 주소를 잘못 붙이지 않게).
+- **공고 단위 자동 주소(`items.address`)**: 첨부 단일 주소 > 상세 페이지 `주택위치`(청년안심·SH) / 사회주택협회 목록 ‘주소’ 열 / LH 상세 `소재지`(단일 단지 공고만, 공고당 1회 조회).
+- **알림 주소 선택(`addr.pick`)**: 사람 `item_meta.address` > 대표 주택형 `units.address` > 같은 단지명의 auto 행 주소(사람 확인 행엔 주소가 없으므로) > 공고 주택형들이 한 주소뿐이면 그것 > `items.address`. 여러 단지인데 대표 단지를 모르면 추측하지 않는다.
+- **없으면 근사**: `주소(근사): 서울 {구} {단지명}`(지도 검색어). 사업명(재개발임대·든든전세 등)뿐이면 줄을 생략.
+- 사람 기록: `units.py meta <src> <id> --address "서울 마포구 OO로 12"` (단일 단지 공고), `units.py unit … --address …`, `verify`는 auto 행 주소를 함께 승격.
 
 ---
 
@@ -266,8 +277,8 @@ venv/bin/python selftest.py
 ✅ **조건 부합** ({n})
 
 • 🏠 **[{단지명 또는 사업명}]({url})** · {대상: 대상 둘 다 선택 시만}
-  - {여러 단지 사업이면 최적 주택형의 단지명} · {구} · {역} · {면적}㎡
-  - 보증금 {보증금}만 / 월세 {월세}만 (전환 옵션) · 자동추출
+  - 주소: {서울 구 도로명 번호}        ← 확정 주소가 없으면 `주소(근사): 서울 {구} {단지명}`
+  - {여러 단지 사업이면 최적 주택형의 단지명} · {역} · {면적}㎡ · 보증금 {보증금}만 / 월세 {월세}만 (전환 옵션) · 자동추출
   - 접수 {MM-DD ~ MM-DD} · 마감 임박 · 무주택세대 자격
 
 ⚠️ **근소 초과** ({n})
@@ -280,8 +291,8 @@ venv/bin/python selftest.py
 ✅ **조건 부합** ({n})
 
 • 🏠 **[청계로벤하임](url)**
-  - 동묘앞역 · 20㎡
-  - 🔁 전환 · 보증금 1억 8,410만 / 월세 3.24만 · 자동추출   ← 전세에 가까운 월세 옵션 (전세 행이면 `전세 1억 8,410만`)
+  - 주소: 서울 종로구 숭인동 240-1
+  - 🔁 전환 · 동묘앞역 · 20㎡ · 보증금 1억 8,410만 / 월세 3.24만 · 자동추출   ← 전세에 가까운 월세 옵션 (전세 행이면 `전세 1억 8,410만`)
   - 접수 10-06 ~ 10-09 · 마감 임박
 
 📋 **지원 프로그램** ({n})
@@ -293,8 +304,8 @@ venv/bin/python selftest.py
 
 **항목 이름·줄 규칙 (`report.notice_name` / `unit_place` / `_item`):**
 - 링크 텍스트 = 단지명: 사람 기록(`item_meta.name`) > 제목 정리(앞쪽 `[민간임대]`·`[서울지역본부]`·`(수정)` 등, 날짜, `20xx년`·하반기·`N차`, ‘입주자 모집공고’·‘추가모집공고’·‘잔여세대’·‘N순위’, 끝의 호실번호 제거; `동묘앞역 청계로벤하임` → 역 분리, `(금천구)` → 구 분리; `…주택` → `매입임대`·`재개발임대` 등 축약).
-- 여러 단지를 묶는 사업 공고(제목에 임대·장기전세·든든전세·행복주택·미리내집 등)는 `SH 재개발임대 일반모집`·`LH 청년 전세임대` 처럼 기관+사업명, 같은 사업명이 겹치면 `(운영기관)`을 붙이고, **첫 하위 줄에 최적 주택형 라벨에서 뽑은 단지명**(+ 라벨의 구·역)을 쓴다.
-- 하위 줄은 최대 3줄: ① 단지명(사업 공고)·구·역·면적 ② 가격(+옵션, 자동추출이면 `· 자동추출`) — 가격이 없는 공고 단위(HUG)는 비고 ③ 접수기간(올해면 MM-DD)·마감 임박·자격(무주택세대 기준이면 `무주택세대 자격`). **모르는 값은 자리표시 없이 생략**하고, 셋 다 비면 줄 자체를 뺀다. (이미지형 미확인 공고만 에이전트용 `이미지:` 줄이 추가될 수 있음.)
+- 여러 단지를 묶는 사업 공고(제목에 임대·장기전세·든든전세·행복주택·미리내집 등)는 `SH 재개발임대 일반모집`·`LH 청년 전세임대` 처럼 기관+사업명, 같은 사업명이 겹치면 `(운영기관)`을 붙이고, **둘째 줄 맨 앞에 최적 주택형 라벨에서 뽑은 단지명**을 쓴다(주소는 그 단지의 주소).
+- 하위 줄은 최대 3줄: ① **주소**(`주소: …` 평문, 링크 없음 — 길게 눌러 복사 → 지도 앱; 확정 주소가 없으면 `주소(근사): 서울 {구} {단지명}`, 단지를 모르는 사업 공고는 생략) ② 단지명(사업 공고)·역·면적·가격(+옵션, 자동추출이면 `· 자동추출`; 🔁 전환은 줄 맨 앞) — 주소 줄이 있으면 구는 주소에 들어 있으므로 생략, 가격이 없는 공고 단위(HUG)는 비고 ③ 접수기간(올해면 MM-DD)·마감 임박·자격(무주택세대 기준이면 `무주택세대 자격`). **모르는 값은 자리표시 없이 생략**(사람 기록의 `확인 필요` 같은 역 자리표시도 생략)하고, 비면 줄 자체를 뺀다. (이미지형 미확인 공고만 에이전트용 `이미지:` 줄이 추가될 수 있음.)
 
 - 이모지는 섹션 제목(✅/⚠️), 단지명 앞 🏠, 전세 전환 옵션 🔁, 지원 프로그램 📋에만 쓴다.
 - 대상이 하나면 대상 태그를 붙이지 않고, 임대유형이 하나면 블록 제목(**월세**/**전세**)을 생략한다 → 기존 승인 템플릿(`**서울 청년 월세 수집**`)과 같다.
@@ -331,6 +342,7 @@ venv/bin/python selftest.py
 - 주택형 단위 제외 구는 라벨·비고에 구 표기가 있을 때만 동작한다(재개발임대 단지명만 있는 행 등은 구를 몰라 유지).  
 - 알림 단지명은 제목·자동추출 라벨 휴리스틱이라 어색할 수 있다 → `units.py meta --name`으로 사람 기록 시 그 값을 쓴다.  
 - HUG 든든전세·LH 전세임대는 공고 단위만(주택별 가격 없음). HUG 공고문은 접수 마감 표기가 서로 다를 수 있어(예: 10.8 / 10.12) 늦은 날짜를 저장하고 경고를 붙인다.  
+- 주소는 공고문·상세 페이지에 적힌 주소를 정규화한 것(지오코딩·검증 없음). 첨부를 처리하지 않는 공고(마감·서울주거포털·첨부 없음)는 `주소(근사)` 또는 생략. LH 매입임대처럼 주택이 여러 곳인 공고는 단일 주소를 만들지 않는다. 같은 단지가 도로명/지번 두 표기로 나올 수 있다(첨부 우선 = 대개 도로명).
 - 자격 한 줄(`elig_note`)은 사람 기록 > 원문 문구(HUG) > ‘세대 기준 공고 — 원문 확인’ 일반 안내 순. 소득·자산·혼인기간은 판정하지 않는다.
 
 ---
@@ -344,6 +356,7 @@ venv/bin/python selftest.py
 | `requirements.txt` / `config.example.json` / `.gitignore` | 의존성·설정 예시·로컬 데이터 제외 |
 | `run_daily.py` / `collect.py` / `sources.py` | 루틴 파이프라인 |
 | `docs.py` / `hdb.py` / `report.py` / `units.py` / `query.py` | 첨부·DB·알림·기록·조회 |
+| `addr.py` | 주소 추출·정규화·주소표 매칭·선택·근사 |
 | `config.json` / `housing.db` / `docs/` | (로컬 생성·git 제외) 설정·상태·첨부 원본·페이지 이미지 |
 | `selftest.py` | 오프라인 회귀 |
 | `templates/alert.md.j2` | 알림 구조 참고용 스케치 |
@@ -373,6 +386,7 @@ housing/
   collect.py           # 수집 오케스트레이션·판정·DB
   sources.py           # 채널별 목록
   docs.py              # 첨부 파싱·캐시(sha256+parser_version)
+  addr.py              # 주소 추출·선택
   hdb.py               # 스키마·judge
   report.py            # 마크다운 알림
   units.py / query.py  # 원문 확인 기록·조회
@@ -386,6 +400,7 @@ housing/
 | `sources.py` | SH / 청년안심 / LH / 서울주거포털 / 사회주택협회 / HUG 든든전세 / LH 전세임대 목록 |
 | `collect.py` | 중복 제거, 첨부 트리거, 판정, listings upsert |
 | `docs.py` | PDF(pdfplumber+페이지 이미지) / HWP(rhwp) / 캐시 |
+| `addr.py` | 공고·첨부·상세 페이지의 단지 주소(도로명/지번) 정규화·주택형 매칭 |
 | `hdb.py` | SQLite + 설정 정규화 + 월세/전세 match/near 판정 |
 | `report.py` | 채팅 블록형 알림(기본) / 카드형 |
 | `run_daily.py` | 하루 N회 호출하는 단일 진입점 |

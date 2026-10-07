@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 import json, re
+import addr
 from pathlib import Path
 
 BASIS_LABEL = {
@@ -181,6 +182,7 @@ def _price_line(r, lease, cfg):
 SEOUL_GU = ('종로구 중구 용산구 성동구 광진구 동대문구 중랑구 성북구 강북구 도봉구 노원구 은평구 서대문구 마포구 양천구 강서구 '
             '구로구 금천구 영등포구 동작구 관악구 서초구 강남구 송파구 강동구').split()
 PROGRAM = re.compile(r'임대|장기전세|전세주택|든든전세|행복주택|미리내집|희망타운')
+GENERIC = re.compile(r'도시형생활주택|가구를\s*위한|모집|공고|~')     # 단지명이 아닌 사업 설명 → 근사 주소 안 만듦
 ORG = {'sh': 'SH', 'seoulportal': 'SH', 'lh': 'LH'}
 _TITLE_NOISE = [                      # 순서 중요
     r'\((운영기관|문의)[^)]*\)',
@@ -199,7 +201,7 @@ def notice_name(r):
     if r.get('name'): return r['name'], None, None, False
     op = re.search(r'\(운영기관\s*:\s*([^)]+)\)', t)
     while True:                                   # 앞쪽 [ ]·(수정) 접두어 반복 제거
-        t2 = re.sub(r'^\s*(\[[^\]]*\]|\((수정|정정)\))\s*', '', t)
+        t2 = re.sub(r'^\s*(\[[^\]]*\]|\((수정|정정)\)|NEW(?=\s))\s*', '', t)    # SH 목록의 'NEW' 배지 포함
         if t2 == t: break
         t = t2
     for pat in _TITLE_NOISE: t = re.sub(pat, ' ', t)
@@ -217,7 +219,7 @@ def notice_name(r):
 
 def unit_place(label):
     """자동추출 주택형 라벨 → (단지명, 구, 역) 또는 None. 예: '강동구 서도휴빌(2차) 102동 42C … 둔촌동역 …' → ('서도휴빌(2차)', '강동구', '둔촌동역')."""
-    s = re.sub(r'보증금\s*\d+%|최대전환|기본|전환\s*\([+\-]\)|\([+\-]\)|\(\d+호\)|\d+(\.\d+)?\s*(㎡|m2)', ' ', label or '')
+    s = re.sub(r'보증금\s*\d+%|최대전환|기본|전환\s*\([+\-]\)|(?<!\S)전환(?!\S)|\([+\-]\)|\(\d+호\)|\d+(\.\d+)?\s*(㎡|m2)', ' ', label or '')
     toks = s.split()
     if not toks or re.match(r'^(row\d|쉐어형|일반|특별|공급|청년|신혼|공통|\[|\(|\d)', toks[0]): return None
     gu = next((x for x in toks if x in SEOUL_GU), None)
@@ -243,8 +245,20 @@ def _flags(r):
     if e: parts.append('무주택세대 자격' if '무주택세대' in e else (e if len(e) <= 24 else e[:23] + '…'))
     return ' · '.join(parts)
 
+def _addr_line(r, lease, name, gu, cx, prog):
+    """'주소: 서울 성북구 성북로4길 52' (복사용 평문, 링크 없음). 확정 주소가 없으면 '주소(근사): 서울 {구} {단지명}'(지도 앱 검색어).
+    여러 단지 사업 공고에서 단지명을 모르면 None."""
+    b = _best(r, lease) or {}
+    a = b.get('address') or r.get('address')
+    if a: return f'주소: {a}'
+    nm = cx if prog else (cx or name)
+    if not nm or (not cx and (PROGRAM.search(nm) or GENERIC.search(nm))) or r.get('lease_type') == 'support': return None   # 사업명(든든전세 등)은 지도 검색어가 못 됨
+    ap = addr.approx(nm, gu)
+    return f'주소(근사): {ap}' if ap else None
+
 def _item(r, lease, cfg, *, show_target):
-    """승인 템플릿: • 🏠 **[단지명](url)** + 최대 3줄 (위치·면적 / 가격 / 접수·자격). 모르는 값은 줄·항목째 생략."""
+    """승인 템플릿: • 🏠 **[단지명](url)** + 최대 3줄
+       (주소 / [단지명 ·] 역 · 면적 · 가격 / 접수·자격). 주소줄은 복사하기 좋게 주소만. 모르는 값은 줄·항목째 생략."""
     name, tgu, tst, prog = notice_name(r)
     head = f"• 🏠 **[{name}]({r['url']})**" if r.get('url') else f'• 🏠 **{name}**'
     b = _best(r, lease) or {}
@@ -255,12 +269,16 @@ def _item(r, lease, cfg, *, show_target):
     up = unit_place(b.get('unit_label')) if prog else None       # 여러 단지 사업 공고 → 최적 주택형의 단지명
     cx, ugu, ust = up if up else (None, None, None)
     area = b.get('area_m2') or (r.get('area_m2') if lease == 'monthly' and not r.get('best_json') else None)
-    loc = [x for x in (cx, (r.get('gu') or ugu or tgu or '').strip(), (r.get('station') or ust or tst or '').strip(), f'{area:g}㎡' if area else '') if x]
+    gu = (r.get('gu') or ugu or tgu or '').strip(); st = (r.get('station') or ust or tst or '').strip()
+    if re.search(r'확인|미상|^-$', st): st = ''                     # 사람 기록 자리표시('확인 필요')는 생략
+    al = _addr_line(r, lease, name, gu, cx, prog)
     lines = [head]
-    if loc: lines.append('  - ' + ' · '.join(loc))
-    pl = _price_line(r, lease, cfg)
-    if pl: lines.append(f'  - {pl}')
-    elif r.get('extra_note'): lines.append(f"  - {r['extra_note']}")
+    if al: lines.append(f'  - {al}')
+    pl = _price_line(r, lease, cfg) or r.get('extra_note')
+    pre = ''
+    if pl and pl.startswith('🔁 전환 · '): pre, pl = '🔁 전환 · ', pl[len('🔁 전환 · '):]
+    mid = [x for x in (cx, None if al else gu, st, f'{area:g}㎡' if area else '', pl) if x]
+    if mid: lines.append('  - ' + pre + ' · '.join(mid))
     fl = _flags(r)
     if fl: lines.append(f'  - {fl}')
     crops = []

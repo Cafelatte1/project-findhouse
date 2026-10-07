@@ -11,8 +11,9 @@
 {% for r in secs[key] %}
 • 🏠 **[{{ r.short_name }}]({{ r.url }})**{% if both_targets and r.target %} · {{ r.target }}{% endif %}
 {# 하위 줄 최대 3줄, 모르는 값은 생략(join 은 빈 값 제외) #}
-  - {{ [r.complex, r.gu, r.station, r.area_m2 ~ '㎡' if r.area_m2] | select | join(' · ') }}
-  - {% if r.conv %}🔁 전환 · {% endif %}{% if lease == 'jeonse' and not r.conv %}전세 {{ man(r.deposit) }}{% else %}보증금 {{ man(r.deposit) }} / 월세 {{ man(r.rent) }}{% endif %}{% if r.auto %} · 자동추출{% endif %}
+{% if r.address %}  - 주소: {{ r.address }}{# 평문(링크 없음) #}
+{% elif r.approx_address %}  - 주소(근사): {{ r.approx_address }}{# 서울 {구} {단지명} #}
+{% endif %}  - {% if r.conv %}🔁 전환 · {% endif %}{{ [r.complex, r.gu if not (r.address or r.approx_address), r.station, r.area_m2 ~ '㎡' if r.area_m2] | select | join(' · ') }} · {% if lease == 'jeonse' and not r.conv %}전세 {{ man(r.deposit) }}{% else %}보증금 {{ man(r.deposit) }} / 월세 {{ man(r.rent) }}{% endif %}{% if r.auto %} · 자동추출{% endif %}
   - {{ [r.period, '마감 임박' if r.is_due_soon, r.elig_short] | select | join(' · ') }}
 {% endfor %}{% endfor %}{% endfor %}
 {% if support %}

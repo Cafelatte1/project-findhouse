@@ -18,11 +18,13 @@ CREATE TABLE IF NOT EXISTS items(          -- 영구 레지스트리 (공고별 
   notified_jeonse TEXT,                    -- 전세: 판정@전세상한
   notified_support TEXT,                   -- 지원 프로그램: 'seen' (신규 1회 알림)
   dedup_key TEXT,                          -- 정규화 제목 (재게시 seq 연결)
+  address TEXT,                            -- 공고 단위 자동 주소(상세 페이지·첨부 '주택위치/소재지'·사회주택협회 목록·LH 소재지)
   PRIMARY KEY(source,item_id));
 CREATE TABLE IF NOT EXISTS item_meta(      -- 공고문 확인 후 수동/에이전트 기록
   source TEXT, item_id TEXT, name TEXT, gu TEXT, station TEXT, housing_type TEXT,
   apply_start TEXT, apply_end TEXT, supply_count TEXT, eligibility TEXT, note TEXT,
-  verified_at TEXT, PRIMARY KEY(source,item_id));
+  verified_at TEXT, address TEXT,          -- address: 사람이 확인한 단지 주소(단일 단지 공고) — 자동 주소보다 우선
+  PRIMARY KEY(source,item_id));
 CREATE TABLE IF NOT EXISTS units(          -- 주택형·보증금비율 옵션별 1행 (만원)
   source TEXT, item_id TEXT, unit_label TEXT, target TEXT,  -- source=수집처(sh/soco..), target: 청년/신혼부부/공통/기타(고령자 등, 판정 제외)
   area_m2 REAL, deposit REAL, rent REAL, note TEXT,
@@ -30,6 +32,7 @@ CREATE TABLE IF NOT EXISTS units(          -- 주택형·보증금비율 옵션�
   verified INTEGER DEFAULT 1,              -- 1=사람 확인, 0=미검증(auto/ocr)
   supply INTEGER, doc_id INTEGER,          -- 공급호수(합계 검산 통과 시), 추출 원본 documents.doc_id
   lease_type TEXT,                         -- monthly | jeonse (월세 0 = 전세 표). NULL = monthly(구 데이터)
+  address TEXT,                            -- 주택형(단지) 주소: 첨부의 단지별 주소표 매칭 또는 공고 단일 주소 (도로명/지번)
   PRIMARY KEY(source,item_id,origin,unit_label));
 CREATE TABLE IF NOT EXISTS documents(      -- 공고 첨부파일 처리 이력 (sha256 같으면 재처리 안 함)
   doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,6 +59,7 @@ CREATE TABLE IF NOT EXISTS listings(       -- 수집일자별 스냅샷
   lease_type TEXT, targets TEXT,           -- 공고 분류: monthly|jeonse|support · 제목/카테고리상 대상(청년,신혼부부; 빈값=일반)
   fit_monthly TEXT, reason_monthly TEXT, fit_jeonse TEXT, reason_jeonse TEXT,   -- 유형별 판정 (NULL=해당 없음)
   best_json TEXT, elig_note TEXT, extra_note TEXT,                               -- 유형별 대표 주택형 JSON · 자격 한 줄 · 소스 메모
+  address TEXT,                            -- 대표 주택형 기준 확정 주소(없으면 NULL → 알림은 '서울 구 단지명' 근사)
   PRIMARY KEY(collected_date,source,item_id));
 CREATE INDEX IF NOT EXISTS ix_listings_date ON listings(collected_date, fit);
 """
@@ -77,6 +81,8 @@ def connect():
           INSERT INTO units(source,item_id,unit_label,target,area_m2,deposit,rent,note,origin,verified) SELECT source,item_id,unit_label,target,area_m2,deposit,rent,note,'human',1 FROM units_v1;
           DROP TABLE units_v1;''')
     _add_cols(c, 'units', ['lease_type TEXT'])
+    _add_cols(c, 'units', ['address TEXT']); _add_cols(c, 'item_meta', ['address TEXT'])          # v4: 주소
+    _add_cols(c, 'items', ['address TEXT']); _add_cols(c, 'listings', ['address TEXT'])
     return c
 def _add_cols(c, table, defs):
     have = [r[1] for r in c.execute(f'PRAGMA table_info({table})')]

@@ -93,6 +93,16 @@ def lh_supply(it, cfg):
         page = curl(LH_INFO, 'panId=%s&ccrCnntSysDsCd=%s&uppAisTpCd=%s&aisTpCd=%s&mi=1026' % m.groups(), timeout=cfg['http_timeout_sec'], retries=cfg['http_retries'])
     except Exception: return None
     return parse_lh_supply(page, cfg.get('exclude_gu') or ())
+def lh_address(it, cfg):
+    """LH 공고 상세의 '소재지 : 서울특별시 …' (단일 단지 공고) → 정규화 주소 또는 None. 여러 주택(매입임대 주소 표)은 None."""
+    import addr
+    m = re.search(r'panId=([^&]+)&ccrCnntSysDsCd=([^&]*)&uppAisTpCd=([^&]*)&aisTpCd=([^&]*)', it.get('url') or '')
+    if not m: return None
+    try:
+        page = curl(LH_INFO, 'panId=%s&ccrCnntSysDsCd=%s&uppAisTpCd=%s&aisTpCd=%s&mi=1026' % m.groups(), timeout=cfg['http_timeout_sec'], retries=cfg['http_retries'])
+    except Exception: return None
+    ex = addr.extract(addr.html_text(page))
+    return ex['notice'][0] if len(ex['notice']) == 1 else None
 def lh_region_keep(region, title, supply):
     """서울 공급 여부 판단 → (keep, note).
     LH 목록 '지역' 열은 첫 지역 + '외'(= 그 지역 외 다른 지역도 포함). 예: '서울특별시 외' = 서울+타 지역(청년 전세임대: 서울 25개 구 포함 230개 지자체),

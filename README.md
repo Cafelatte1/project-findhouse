@@ -83,8 +83,8 @@ Example (both types, both targets):
 ✅ **조건 부합** (2)
 
 • 🏠 **[SH 신혼·신생아 매입임대Ⅰ](url)** · 신혼부부
-  - 서도휴빌(2차) · 강동구 · 둔촌동역 · 44.42㎡
-  - 보증금 1,953만 / 월세 25.44만 (보증금50%) · 자동추출
+  - 주소: 서울 강동구 성내동 440-26
+  - 서도휴빌(2차) · 둔촌동역 · 44.42㎡ · 보증금 1,953만 / 월세 25.44만 (보증금50%) · 자동추출
   - 무주택세대 자격
 
 **전세**
@@ -93,15 +93,20 @@ Example (both types, both targets):
 ✅ **조건 부합** (1)
 
 • 🏠 **[청계로벤하임](url)** · 청년
-  - 동묘앞역 · 20㎡
-  - 🔁 전환 · 보증금 1억 8,410만 / 월세 3.24만 · 자동추출
+  - 주소: 서울 종로구 숭인동 240-1
+  - 🔁 전환 · 동묘앞역 · 20㎡ · 보증금 1억 8,410만 / 월세 3.24만 · 자동추출
   - 접수 10-06 ~ 10-09 · 마감 임박
 ```
 
 With a single target no target tag is printed, and with a single lease type the block heading is omitted (the original template).
 The link text is the complex name (human-recorded name, else a cleaned-up title); notices that bundle many complexes use a short
-program name (e.g. `SH 재개발임대 일반모집`) and put the best unit's complex in the first sub-bullet. Each item has at most 3 sub-bullets
-(location/area · price · window/eligibility); unknown parts are omitted rather than shown as placeholders.
+program name (e.g. `SH 재개발임대 일반모집`) and put the best unit's complex at the start of the second sub-bullet. Each item has at most
+3 sub-bullets: (1) `주소: 서울 성북구 성북로4길 52` — plain text, no link, so it can be long-pressed/copied into a map app;
+`주소(근사): 서울 {구} {단지명}` when only the complex name is known; omitted for program notices whose complex is unknown,
+(2) [complex ·] station · area · price, (3) window/eligibility. Unknown parts are omitted rather than shown as placeholders.
+Addresses come from the notice itself (no geocoding API): a labelled `주택위치/소재지/위치` line, the per-complex address table of
+multi-complex notices (e.g. SH 재개발임대 '단지별 상세주소', matched to unit labels), the 청년안심 detail page, the 사회주택협회 list,
+or the LH detail `소재지`. A human-confirmed address can be set with `units.py meta <src> <id> --address "…"`.
 
 Targets: a title for one target only (e.g. 신혼·신생아) is shown only when that target is selected; mixed titles (`청년·신혼부부`,
 `청년 및 신혼부부`) and untagged notices are shown for either selection, and unit rows for unselected targets are dropped.
@@ -133,6 +138,7 @@ Full design, schema, alert template and limitations: [`DESIGN.md`](DESIGN.md).
 - Eligibility (income / assets / subscription account / no-home household / marriage period) is not auto-judged; a short note is shown and the notice must be checked.
 - Jeonse support programs (전세임대) and HUG 든든전세 are notice-level only: no per-house price judgment.
 - LH region labels like `서울특별시 외` mean "Seoul and other regions" (not "outside Seoul"); Seoul supply is confirmed from the notice detail's supply list, and notices without Seoul supply are dropped.
+- Addresses are copied from the notice text (normalized, not geocoded/verified). Notices whose attachments are not processed (closed, portal mirrors, no attachment) show an approximate `주소(근사)` or no address; multi-house notices (e.g. LH 매입임대) get no single address.
 - Site structure changes break parsers; source failures are isolated and reported, LH has an explicit structure-change canary.
 - 마이홈포털 is not collected (blocked from many networks); the data.go.kr API is a possible future source.
 
